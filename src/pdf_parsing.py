@@ -3,6 +3,7 @@ import time
 import logging
 import re
 import json
+import concurrent.futures
 from tabulate import tabulate
 from pathlib import Path
 from typing import Iterable, List
@@ -17,17 +18,59 @@ _log = logging.getLogger(__name__)
 
 def _process_chunk(pdf_paths, pdf_backend, output_dir, num_threads, metadata_lookup, debug_data_path):
     """Helper function to process a chunk of PDFs in a separate process."""
-    # Create a new parser instance for this process
-    parser = PDFParser(
-        pdf_backend=pdf_backend,
-        output_dir=output_dir,
-        num_threads=num_threads,
-        csv_metadata_path=None  # Metadata lookup is passed directly
-    )
-    parser.metadata_lookup = metadata_lookup
-    parser.debug_data_path = debug_data_path
-    parser.parse_and_export(pdf_paths)
-    return f"Processed {len(pdf_paths)} PDFs."
+    import os
+    import traceback
+    import gc
+    
+    worker_pid = os.getpid()
+    file_names = [p.name for p in pdf_paths]
+    
+    try:
+        # 🎯 方案1: 简洁的起始日志（使用logging而不是print）
+        _log.info(f"[Worker {worker_pid}] Starting: {file_names}")
+        start_time = time.time()
+        
+        # Create a new parser instance for this process
+        parser = PDFParser(
+            pdf_backend=pdf_backend,
+            output_dir=output_dir,
+            num_threads=num_threads,
+            csv_metadata_path=None  # Metadata lookup is passed directly
+        )
+        parser.metadata_lookup = metadata_lookup
+        parser.debug_data_path = debug_data_path
+        
+        # 🔧 方案2: 启用Docling的详细日志（与主进程配置保持一致）
+        logging.getLogger('docling').setLevel(logging.INFO)
+        logging.getLogger('docling.pipeline.base_pipeline').setLevel(logging.DEBUG)
+        
+        # Process all PDFs (Docling内部会显示详细的page batch进度)
+        parser.parse_and_export(pdf_paths)
+        
+        elapsed = time.time() - start_time
+        _log.info(f"[Worker {worker_pid}] ✅ Completed {len(pdf_paths)} file(s) in {elapsed:.1f}s")
+        
+        # 🧹 Explicit garbage collection to free memory
+        gc.collect()
+        
+        return f"Processed {len(pdf_paths)} PDFs."
+        
+    except Exception as e:
+        _log.error(f"[Worker {worker_pid}] ❌ FATAL ERROR processing {file_names}")
+        _log.error(f"[Worker {worker_pid}] Exception: {type(e).__name__}: {str(e)}")
+        _log.error(f"[Worker {worker_pid}] Traceback:\n{traceback.format_exc()}")
+        
+        # Try to log memory info if possible
+        try:
+            import psutil
+            process = psutil.Process(os.getpid())
+            mem_info = process.memory_info()
+            _log.error(f"[Worker {worker_pid}] Memory usage: {mem_info.rss / 1024**3:.2f} GB")
+        except:
+            pass
+        
+        # Re-raise to signal failure to parent process
+        raise
 
 class PDFParser:
     def __init__(
@@ -49,7 +92,29 @@ class PDFParser:
             
         if self.num_threads is not None:
             os.environ["OMP_NUM_THREADS"] = str(self.num_threads)
+        
+        # 🚀 GPU 配置
+        self._setup_gpu()
 
+    def _setup_gpu(self):
+        """Configure GPU settings for Docling models."""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                gpu_count = torch.cuda.device_count()
+                _log.info(f"🚀 GPU detected: {gpu_count} device(s)")
+                for i in range(gpu_count):
+                    gpu_name = torch.cuda.get_device_name(i)
+                    gpu_mem = torch.cuda.get_device_properties(i).total_memory / 1e9
+                    _log.info(f"  GPU {i}: {gpu_name} ({gpu_mem:.1f} GB)")
+                
+                # 设置默认 GPU
+                os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+            else:
+                _log.warning("⚠️ CUDA not available, using CPU")
+        except ImportError:
+            _log.warning("⚠️ PyTorch not installed, GPU acceleration disabled")
+    
     @staticmethod
     def _parse_csv_metadata(csv_path: Path) -> dict:
         """Parse CSV file and create a lookup dictionary with sha1 as key."""
@@ -74,9 +139,14 @@ class PDFParser:
         from docling.pipeline.standard_pdf_pipeline import StandardPdfPipeline
         
         pipeline_options = PdfPipelineOptions()
-        pipeline_options.do_ocr = True
-        ocr_options = EasyOcrOptions(lang=['en'], force_full_page_ocr=False)
-        pipeline_options.ocr_options = ocr_options
+        pipeline_options.do_ocr = False  # ← 默认关闭 OCR（纯文本 PDF 更快）
+        # 🚀 GPU 加速配置 + 中文支持（OCR 开启时才会使用）
+        ocr_options = EasyOcrOptions(
+            lang=['ch_sim', 'en'],  # ← 简体中文 + 英文（金盘科技年报）
+            force_full_page_ocr=False,
+            use_gpu=True  # ← 启用 GPU
+        )
+        pipeline_options.ocr_options = ocr_options  # 保留配置，需要时可手动开启
         pipeline_options.do_table_structure = True
         pipeline_options.table_structure_options.do_cell_matching = True
         pipeline_options.table_structure_options.mode = TableFormerMode.ACCURATE
@@ -191,6 +261,13 @@ class PDFParser:
         import multiprocessing
         from concurrent.futures import ProcessPoolExecutor, as_completed
 
+        # 🎯 方案2: 在主进程配置Docling日志级别（会被子进程继承）
+        # 根据Docling源码(base_pipeline.py:261)，页面批次进度在DEBUG级别
+        # 只为pipeline模块启用DEBUG，避免其他模块的过多输出
+        logging.getLogger('docling').setLevel(logging.INFO)  # 总体保持INFO
+        logging.getLogger('docling.pipeline.base_pipeline').setLevel(logging.DEBUG)  # 关键模块用DEBUG
+        _log.info("✅ Enabled Docling pipeline DEBUG logging for page batch progress")
+
         # Get input paths if not provided
         if input_doc_paths is None and doc_dir is not None:
             input_doc_paths = list(doc_dir.glob("*.pdf"))
@@ -213,15 +290,37 @@ class PDFParser:
             input_doc_paths[i : i + chunk_size]
             for i in range(0, total_pdfs, chunk_size)
         ]
+        
+        # 🔍 DEBUG: Print chunk distribution
+        _log.info(f"{'='*60}")
+        _log.info(f"Chunk size: {chunk_size}, Number of chunks: {len(chunks)}")
+        for idx, chunk in enumerate(chunks):
+            file_names = [p.name for p in chunk]
+            _log.info(f"  Chunk {idx+1}: {file_names}")
+        _log.info(f"{'='*60}")
 
         start_time = time.time()
         processed_count = 0
         
+        # 🚀 Fix CUDA fork error: Use 'spawn' instead of 'fork'
+        # CUDA cannot be re-initialized in forked subprocesses
+        # spawn creates fresh processes, avoiding CUDA context issues
+        try:
+            multiprocessing.set_start_method('spawn', force=True)
+            _log.info("✅ Set multiprocessing start method to 'spawn' (CUDA-compatible)")
+        except RuntimeError as e:
+            # Start method already set (expected in some environments)
+            _log.debug(f"Multiprocessing start method already set: {e}")
+        
         # Use ProcessPoolExecutor for parallel processing
-        with ProcessPoolExecutor(max_workers=optimal_workers) as executor:
+        executor = None
+        try:
+            executor = ProcessPoolExecutor(max_workers=optimal_workers)
+            
             # Schedule all tasks
-            futures = [
-                executor.submit(
+            futures = {}
+            for idx, chunk in enumerate(chunks):
+                future = executor.submit(
                     _process_chunk,
                     chunk,
                     self.pdf_backend,
@@ -230,18 +329,33 @@ class PDFParser:
                     self.metadata_lookup,
                     self.debug_data_path
                 )
-                for chunk in chunks
-            ]
+                futures[future] = (idx, [p.name for p in chunk])
             
             # Wait for completion and log results
             for future in as_completed(futures):
+                chunk_idx, file_names = futures[future]
                 try:
-                    result = future.result()
+                    result = future.result(timeout=3600)  # 1 hour timeout per chunk
                     processed_count += int(result.split()[1])  # Extract number from "Processed X PDFs"
-                    _log.info(f"{'#'*50}\n{result} ({processed_count}/{total_pdfs} total)\n{'#'*50}")
-                except Exception as e:
-                    _log.error(f"Error processing chunk: {str(e)}")
+                    _log.info(f"{'#'*50}\n✅ Chunk {chunk_idx+1}: {result} ({processed_count}/{total_pdfs} total)\n{'#'*50}")
+                except concurrent.futures.TimeoutError:
+                    _log.error(f"❌ Chunk {chunk_idx+1} ({file_names}) timed out after 1 hour")
                     raise
+                except concurrent.futures.process.BrokenProcessPool as e:
+                    _log.error(f"❌ Worker process crashed while processing Chunk {chunk_idx+1} ({file_names})")
+                    _log.error(f"   This usually indicates: Out of Memory (OOM) or CUDA error")
+                    _log.error(f"   Try reducing max_workers or chunk_size")
+                    raise
+                except Exception as e:
+                    _log.error(f"❌ Error processing Chunk {chunk_idx+1} ({file_names}): {str(e)}")
+                    import traceback
+                    _log.error(traceback.format_exc())
+                    raise
+        finally:
+            # Ensure executor is properly cleaned up
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=False)
+                _log.debug("Executor shutdown completed")
 
         elapsed_time = time.time() - start_time
         _log.info(f"Parallel processing completed in {elapsed_time:.2f} seconds.")

@@ -1,11 +1,26 @@
-data/erc2_set/pdf_reports/
-data/erc2_set/debug_data/
-data/erc2_set/databases/
-data/erc2_set/databases_ser_tab/
+# 忽略 data 文件夹及其内容（除了必要的配置文件）
+data/round1/
+data/round2/
+data/test_set/databases/
+data/test_set/debug_data/
+data/test_set/answers_*.json
+data/val_set/
+data/erc2_set/
 
-data/test_set/debug_data
-data/test_set/databases
-data/test_set/databases_ser_tab
+# 忽略部署相关敏感文档
+docs/DEPLOYMENT_10.222.4.30.md
+docs/*_old.md
+
+# 忽略虚拟环境
+venv_streamlit/
+
+# 忽略 macOS 系统文件
+.DS_Store
+
+# 忽略临时文档
+*CLEANUP*.md
+*SUMMARY*.md
+docs/*_v2.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

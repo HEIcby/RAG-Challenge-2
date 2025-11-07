@@ -1,4 +1,5 @@
 import click
+import copy
 from pathlib import Path
 from src.pipeline import Pipeline, configs, preprocess_configs
 
@@ -47,14 +48,17 @@ def process_reports(config):
     pipeline.process_parsed_reports()
 
 @cli.command()
-@click.option('--config', type=click.Choice(['base', 'pdr', 'max', 'max_no_ser_tab', 'max_nst_o3m', 'max_st_o3m', 'ibm_llama70b', 'ibm_llama8b', 'gemini_thinking']), default='base', help='Configuration preset to use')
-def process_questions(config):
+@click.option('--config', type=click.Choice(['base', 'pdr', 'max', 'max_no_ser_tab', 'max_nst_o3m', 'max_st_o3m', 'ibm_llama70b', 'ibm_llama8b', 'gemini_thinking', 'qwen', 'qwen_max','qwen_plus']), default='base', help='Configuration preset to use')
+@click.option('--use-hyde/--no-hyde', default=True, help='Enable HYDE hypothetical document expansion')
+@click.option('--use-multi-query/--no-multi-query', default=True, help='Enable multi-query expansion')
+def process_questions(config, use_hyde, use_multi_query):
     """Process questions using the pipeline."""
     root_path = Path.cwd()
-    run_config = configs[config]
+    run_config = copy.deepcopy(configs[config])
+    run_config.use_hyde = use_hyde
+    run_config.use_multi_query = use_multi_query
     pipeline = Pipeline(root_path, run_config=run_config)
-    
-    click.echo(f"Processing questions (config={config})...")
+    click.echo(f"Processing questions (config={config}, use_hyde={use_hyde}, use_multi_query={use_multi_query})...")
     pipeline.process_questions()
 
 if __name__ == '__main__':

@@ -16,79 +16,145 @@ def build_system_prompt(instruction: str="", example: str="", pydantic_schema: s
     return system_prompt
 
 class RephrasedQuestionsPrompt:
+    """问题拆解提示词 - 将复杂问题分解为多个子问题"""
     instruction = """
-You are a question rephrasing system.
-Your task is to break down a comparative question into individual questions for each company mentioned.
-Each output question must be self-contained, maintain the same intent and metric as the original question, be specific to the respective company, and use consistent phrasing.
+你是一个问题拆解系统。
+你的任务是将复杂问题分解为更简单的、可独立回答的子问题。
+
+**指导原则：**
+1. 每个子问题应该是原子性的，专注于单一信息点
+2. 子问题应保持逻辑顺序和依赖关系（如果问题A的答案是问题B所需的，则A在前）
+3. 每个子问题必须是自包含的，可以独立回答
+4. 保留原问题中的所有具体细节（日期、指标、公司名称等）
+5. 如果原问题已经足够简单，可以只返回一个子问题（即原问题本身）
+
+**何时需要拆解：**
+- 比较性问题（如"2024年相比2023年增长了多少？"）→ 拆分为各年份的独立查询
+- 多部分问题（如"营业收入和净利润分别是多少？"）→ 分离各个部分
+- 需要中间计算的问题（如"增长率是多少？"）→ 拆分为计算所需的各个组成部分
+- 涉及多个时间段的问题 → 按时间段分离
+- 涉及多个指标的问题 → 按指标分离
+
+**何时不需要拆解：**
+- 简单的直接问题，只询问一个信息点
+- 已经是原子性的问题
 """
 
-    class RephrasedQuestion(BaseModel):
-        """Individual question for a company"""
-        company_name: str = Field(description="Company name, exactly as provided in quotes in the original question")
-        question: str = Field(description="Rephrased question specific to this company")
+    class SubQuestion(BaseModel):
+        """子问题"""
+        question: str = Field(description="可独立回答的自包含子问题")
+        reasoning: str = Field(description="简要说明为什么需要这个子问题（1-2句话）")
 
-    class RephrasedQuestions(BaseModel):
-        """List of rephrased questions"""
-        questions: List['RephrasedQuestionsPrompt.RephrasedQuestion'] = Field(description="List of rephrased questions for each company")
+    class DecomposedQuestions(BaseModel):
+        """拆解后的子问题列表"""
+        sub_questions: List['RephrasedQuestionsPrompt.SubQuestion'] = Field(description="按逻辑顺序排列的子问题列表")
 
     pydantic_schema = '''
-class RephrasedQuestion(BaseModel):
-    """Individual question for a company"""
-    company_name: str = Field(description="Company name, exactly as provided in quotes in the original question")
-    question: str = Field(description="Rephrased question specific to this company")
+class SubQuestion(BaseModel):
+    """子问题"""
+    question: str = Field(description="可独立回答的自包含子问题")
+    reasoning: str = Field(description="简要说明为什么需要这个子问题（1-2句话）")
 
-class RephrasedQuestions(BaseModel):
-    """List of rephrased questions"""
-    questions: List['RephrasedQuestionsPrompt.RephrasedQuestion'] = Field(description="List of rephrased questions for each company")
+class DecomposedQuestions(BaseModel):
+    """拆解后的子问题列表"""
+    sub_questions: List['RephrasedQuestionsPrompt.SubQuestion'] = Field(description="按逻辑顺序排列的子问题列表")
 '''
 
     example = r"""
-Example:
-Input:
-Original comparative question: 'Which company had higher revenue in 2022, "Apple" or "Microsoft"?'
-Companies mentioned: "Apple", "Microsoft"
+示例1（比较性问题）：
+输入：
+原问题：'金盘科技2024年相比2023年的营业收入增长了多少？'
 
-Output:
+输出：
 {
-    "questions": [
+    "sub_questions": [
         {
-            "company_name": "Apple",
-            "question": "What was Apple's revenue in 2022?"
+            "question": "金盘科技2023年的营业收入是多少？",
+            "reasoning": "需要获取2023年的营业收入作为基准值"
         },
         {
-            "company_name": "Microsoft", 
-            "question": "What was Microsoft's revenue in 2022?"
+            "question": "金盘科技2024年的营业收入是多少？",
+            "reasoning": "需要获取2024年的营业收入以进行比较"
+        }
+    ]
+}
+
+示例2（多部分问题）：
+输入：
+原问题：'金盘科技2025年第一季度的营业收入和净利润分别是多少？'
+
+输出：
+{
+    "sub_questions": [
+        {
+            "question": "金盘科技2025年第一季度的营业收入是多少？",
+            "reasoning": "问题的第一部分，询问营业收入"
+        },
+        {
+            "question": "金盘科技2025年第一季度的净利润是多少？",
+            "reasoning": "问题的第二部分，询问净利润"
+        }
+    ]
+}
+
+示例3（简单问题 - 无需拆解）：
+输入：
+原问题：'金盘科技的董事长是谁？'
+
+输出：
+{
+    "sub_questions": [
+        {
+            "question": "金盘科技的董事长是谁？",
+            "reasoning": "这是一个简单的直接问题，无需进一步分解"
+        }
+    ]
+}
+
+示例4（需要计算的问题）：
+输入：
+原问题：'金盘科技2024年的营业利润率是多少？'
+
+输出：
+{
+    "sub_questions": [
+        {
+            "question": "金盘科技2024年的营业利润是多少？",
+            "reasoning": "需要获取营业利润作为计算分子"
+        },
+        {
+            "question": "金盘科技2024年的营业收入是多少？",
+            "reasoning": "需要获取营业收入作为计算分母，用于计算利润率"
         }
     ]
 }
 """
 
-    user_prompt = "Original comparative question: '{question}'\n\nCompanies mentioned: {companies}"
+    user_prompt = "原问题：'{question}'"
 
     system_prompt = build_system_prompt(instruction, example)
 
     system_prompt_with_schema = build_system_prompt(instruction, example, pydantic_schema)
 
-
 class AnswerWithRAGContextSharedPrompt:
     instruction = """
-You are a RAG (Retrieval-Augmented Generation) answering system.
-Your task is to answer the given question based only on information from the company's annual report, which is uploaded in the format of relevant pages extracted using RAG.
+你是一个RAG（检索增强生成）问答系统。
+你的任务是仅根据从公司年度报告中提取的相关页面信息来回答问题。
 
-Before giving a final answer, carefully think out loud and step by step. Pay special attention to the wording of the question.
-- Keep in mind that the content containing the answer may be worded differently than the question.
-- The question was autogenerated from a template, so it may be meaningless or not applicable to the given company.
+在给出最终答案之前，请仔细进行逐步思考分析。特别注意问题的措辞。
+- 请记住，包含答案的内容可能与问题的措辞不同。
+- 问题可能是从模板自动生成的，因此可能对该公司没有意义或不适用。
 """
 
     user_prompt = """
-Here is the context:
+以下是上下文信息：
 \"\"\"
 {context}
 \"\"\"
 
 ---
 
-Here is the question:
+以下是问题：
 "{question}"
 """
 
@@ -138,8 +204,6 @@ Answer:
     system_prompt = build_system_prompt(instruction, example)
 
     system_prompt_with_schema = build_system_prompt(instruction, example, pydantic_schema)
-
-
 
 class AnswerWithRAGContextNumberPrompt:
     instruction = AnswerWithRAGContextSharedPrompt.instruction
@@ -192,9 +256,13 @@ Pay attention if value wrapped in parentheses, it means that value is negative.
     Example of value from context: 780000 USD, but question mentions EUR
     Final answer: 'N/A'
 
-- Return 'N/A' if metric is not directly stated in context EVEN IF it could be calculated from other metrics in the context
-    Example: Requested metric: Dividend per Share; Only available metrics from context: Total Dividends Paid ($5,000,000), and Number of Outstanding Shares (1,000,000); Calculated DPS = Total Dividends / Outstanding Shares.
-    Final answer: 'N/A'
+- You MAY perform simple calculations if:
+    1. The calculation uses directly stated values from the context
+    2. The calculation is a standard financial formula (e.g., percentages, ratios)
+    3. All required values are explicitly present in the context
+    Example: If R&D Investment = 63,056,910.90 yuan and R&D as % of Revenue = 4.70%, you can calculate Revenue = 63,056,910.90 / (4.70 / 100)
+
+- Return 'N/A' if metric requires complex calculations or assumptions beyond simple arithmetic
 
 - Return 'N/A' if information is not available in the context
 """)
@@ -235,8 +303,6 @@ Answer:
     system_prompt = build_system_prompt(instruction, example)
 
     system_prompt_with_schema = build_system_prompt(instruction, example, pydantic_schema)
-
-
 
 class AnswerWithRAGContextBooleanPrompt:
     instruction = AnswerWithRAGContextSharedPrompt.instruction
@@ -280,8 +346,6 @@ Answer:
     system_prompt = build_system_prompt(instruction, example)
 
     system_prompt_with_schema = build_system_prompt(instruction, example, pydantic_schema)
-
-
 
 class AnswerWithRAGContextNamesPrompt:
     instruction = AnswerWithRAGContextSharedPrompt.instruction
@@ -344,54 +408,54 @@ Answer:
 
 class ComparativeAnswerPrompt:
     instruction = """
-You are a question answering system.
-Your task is to analyze individual company answers and provide a comparative response that answers the original question.
-Base your analysis only on the provided individual answers - do not make assumptions or include external knowledge.
-Before giving a final answer, carefully think out loud and step by step.
+你是一个问答系统。
+你的任务是分析各个公司的答案，并提供回答原始问题的比较性回答。
+仅基于提供的各个公司答案进行分析 - 不要做假设或包含外部知识。
+在给出最终答案之前，请仔细进行逐步思考分析。
 
-Important rules for comparison:
-- When the question asks to choose one of the companies (e.g., when comparing metrics), return the company name exactly as it appears in the original question
-- If a company's metric is in a different currency than what is asked in the question, exclude that company from comparison
-- If all companies are excluded (due to currency mismatch or other reasons), return 'N/A' as the final answer
-- If all companies except one are excluded, return the name of the remaining company (even though there is no actual comparison possible)
+比较的重要规则：
+- 当问题要求选择其中一家公司时（例如，比较指标时），返回公司名称，必须与原始问题中出现的完全一致
+- 如果公司的指标使用的货币与问题中要求的不同，则将该公司从比较中排除
+- 如果所有公司都被排除（由于货币不匹配或其他原因），则最终答案返回'不适用'
+- 如果除了一家公司外所有公司都被排除，则返回剩余公司的名称（即使无法进行实际比较）
 """
 
     user_prompt = """
-Here are the individual company answers:
+以下是各个公司的答案：
 \"\"\"
 {context}
 \"\"\"
 
 ---
 
-Here is the original comparative question:
+以下是原始比较问题：
 "{question}"
 """
 
     class AnswerSchema(BaseModel):
-        step_by_step_analysis: str = Field(description="Detailed step-by-step analysis of the answer with at least 5 steps and at least 150 words.")
+        step_by_step_analysis: str = Field(description="详细的逐步分析过程，至少5个步骤，至少150字。")
 
-        reasoning_summary: str = Field(description="Concise summary of the step-by-step reasoning process. Around 50 words.")
+        reasoning_summary: str = Field(description="对逐步推理过程的简明总结，约50字。")
 
-        relevant_pages: List[int] = Field(description="Just leave empty")
+        relevant_pages: List[int] = Field(description="留空即可")
 
-        final_answer: Union[str, Literal["N/A"]] = Field(description="""
-Company name should be extracted exactly as it appears in question.
-Answer should be either a single company name or 'N/A' if no company is applicable.
+        final_answer: Union[str, Literal["不适用"]] = Field(description="""
+公司名称应完全按照问题中出现的方式提取。
+答案应为单个公司名称或'不适用'（如果没有公司适用）。
 """)
 
     pydantic_schema = re.sub(r"^ {4}", "", inspect.getsource(AnswerSchema), flags=re.MULTILINE)
 
     example = r"""
-Example:
-Question:
-"Which of the companies had the lowest total assets in USD at the end of the period listed in the annual report: "CrossFirst Bank", "Sleep Country Canada Holdings Inc.", "Holley Inc.", "PowerFleet, Inc.", "Petra Diamonds"? If data for the company is not available, exclude it from the comparison."
+示例：
+问题：
+"以下哪家公司在年度报告中列出的期末总资产（以美元计）最低："CrossFirst Bank"、"Sleep Country Canada Holdings Inc."、"Holley Inc."、"PowerFleet, Inc."、"Petra Diamonds"？如果某公司的数据不可用，则将其从比较中排除。"
 
-Answer:
+答案：
 ```
 {
-  "step_by_step_analysis": "1. The question asks for the company with the lowest total assets in USD.\n2. Gather the total assets in USD for each company from the individual answers: CrossFirst Bank: $6,601,086,000; Holley Inc.: $1,249,642,000; PowerFleet, Inc.: $217,435,000; Petra Diamonds: $1,078,600,000.\n3. Sleep Country Canada Holdings Inc. is excluded because its assets are not reported in USD.\n4. Compare the total assets: PowerFleet, Inc. ($217,435,000) < Petra Diamonds ($1,078,600,000) < Holley Inc. ($1,249,642,000)  < CrossFirst Bank ($6,601,086,000).\n5. Therefore, PowerFleet, Inc. has the lowest total assets in USD.",
-  "reasoning_summary": "The individual answers provided the total assets in USD for each company except Sleep Country Canada Holdings Inc. (excluded due to currency mismatch). Direct comparison shows PowerFleet, Inc. has the lowest total assets.",
+  "step_by_step_analysis": "1. 问题要求找出总资产（以美元计）最低的公司。\n2. 从各个公司的答案中收集以美元计的总资产：CrossFirst Bank：$6,601,086,000；Holley Inc.：$1,249,642,000；PowerFleet, Inc.：$217,435,000；Petra Diamonds：$1,078,600,000。\n3. Sleep Country Canada Holdings Inc. 被排除，因为其资产不是以美元报告的。\n4. 比较总资产：PowerFleet, Inc.（$217,435,000）< Petra Diamonds（$1,078,600,000）< Holley Inc.（$1,249,642,000）< CrossFirst Bank（$6,601,086,000）。\n5. 因此，PowerFleet, Inc. 的总资产（以美元计）最低。",
+  "reasoning_summary": "各个公司的答案提供了除Sleep Country Canada Holdings Inc.（因货币不匹配被排除）外所有公司的以美元计的总资产。直接比较显示PowerFleet, Inc.的总资产最低。",
   "relevant_pages": [],
   "final_answer": "PowerFleet, Inc."
 }
@@ -402,98 +466,348 @@ Answer:
     
     system_prompt_with_schema = build_system_prompt(instruction, example, pydantic_schema)
 
-
 class AnswerSchemaFixPrompt:
     system_prompt = """
-You are a JSON formatter.
-Your task is to format raw LLM response into a valid JSON object.
-Your answer should always start with '{' and end with '}'
-Your answer should contain only json string, without any preambles, comments, or triple backticks.
+你是一个JSON格式化器。
+你的任务是将原始的LLM响应格式化为有效的JSON对象。
+你的答案应始终以'{'开头，以'}'结尾。
+你的答案应仅包含json字符串，不要有任何前言、注释或三个反引号。
 """
 
     user_prompt = """
-Here is the system prompt that defines schema of the json object and provides an example of answer with valid schema:
+以下是定义json对象schema并提供有效schema答案示例的系统提示：
 \"\"\"
 {system_prompt}
 \"\"\"
 
 ---
 
-Here is the LLM response that not following the schema and needs to be properly formatted:
+以下是未遵循schema且需要正确格式化的LLM响应：
 \"\"\"
 {response}
 \"\"\"
 """
 
-
-
-
 class RerankingPrompt:
     system_prompt_rerank_single_block = """
-You are a RAG (Retrieval-Augmented Generation) retrievals ranker.
+你是一个RAG（检索增强生成）检索结果排序器。
 
-You will receive a query and retrieved text block related to that query. Your task is to evaluate and score the block based on its relevance to the query provided.
+你将收到一个查询和与该查询相关的检索文本块。你的任务是根据文本块与查询的相关性对其进行评估和评分。
 
-Instructions:
+**重要的上下文信息：**
+每个文本块都以来源标签开头，如 "[来源: J2020]"、"[来源: J2021]" 等：
+- J2020 = 金盘科技 2020年公告合集（包含2020年度发布的所有公告文件）
+- J2021 = 金盘科技 2021年公告合集（包含2021年度发布的所有公告文件）
+- J2022 = 金盘科技 2022年公告合集（包含2022年度发布的所有公告文件）
+- J2023 = 金盘科技 2023年公告合集（包含2023年度发布的所有公告文件）
+- J2024 = 金盘科技 2024年公告合集（包含2024年度发布的所有公告文件）
+- J2025 = 金盘科技 2025年公告合集（包含2025年度发布的所有公告文件）
 
-1. Reasoning: 
-   Analyze the block by identifying key information and how it relates to the query. Consider whether the block provides direct answers, partial insights, or background context relevant to the query. Explain your reasoning in a few sentences, referencing specific elements of the block to justify your evaluation. Avoid assumptions—focus solely on the content provided.
+**重要说明：** 年度报告通常在次年发布，例如2024年的年度报告（含全年四个季度的完整数据）可能出现在2025年公告合集中。
 
-2. Relevance Score (0 to 1, in increments of 0.1):
-   0 = Completely Irrelevant: The block has no connection or relation to the query.
-   0.1 = Virtually Irrelevant: Only a very slight or vague connection to the query.
-   0.2 = Very Slightly Relevant: Contains an extremely minimal or tangential connection.
-   0.3 = Slightly Relevant: Addresses a very small aspect of the query but lacks substantive detail.
-   0.4 = Somewhat Relevant: Contains partial information that is somewhat related but not comprehensive.
-   0.5 = Moderately Relevant: Addresses the query but with limited or partial relevance.
-   0.6 = Fairly Relevant: Provides relevant information, though lacking depth or specificity.
-   0.7 = Relevant: Clearly relates to the query, offering substantive but not fully comprehensive information.
-   0.8 = Very Relevant: Strongly relates to the query and provides significant information.
-   0.9 = Highly Relevant: Almost completely answers the query with detailed and specific information.
-   1 = Perfectly Relevant: Directly and comprehensively answers the query with all the necessary specific information.
+**基于时间的相关性：**
+当查询提到特定年份或日期时，需要考虑：
+1. 优先查找对应年份的公告合集
+2. 对于年度数据，也要考虑次年的公告合集（因为年报在次年发布）
+3. 评估时请同时考虑内容相关性和时间相关性
 
-3. Additional Guidance:
-   - Objectivity: Evaluate block based only on their content relative to the query.
-   - Clarity: Be clear and concise in your justifications.
-   - No assumptions: Do not infer information beyond what's explicitly stated in the block.
+**评估指南：**
+
+1. 推理分析（reasoning）： 
+   通过识别关键信息以及它与查询的关系来分析文本块。考虑该块是提供直接答案、部分见解，还是与查询相关的背景信息。用几句话解释你的推理，引用文本块的具体元素来证明你的评估。避免假设——只关注提供的内容。
+
+2. 相关性评分（relevance_score，0到1，以0.1为增量）：
+   0.0 = 完全不相关：文本块与查询没有任何联系或关系
+   0.1 = 几乎不相关：与查询只有非常轻微或模糊的联系
+   0.2 = 非常轻微相关：包含极其微小或切线的联系
+   0.3 = 轻微相关：涉及查询的一个非常小的方面，但缺乏实质性细节
+   0.4 = 有些相关：包含部分相关的信息，但不全面
+   0.5 = 中度相关：涉及查询，但相关性有限或部分
+   0.6 = 相当相关：提供相关信息，但缺乏深度或特异性
+   0.7 = 相关：明确与查询相关，提供实质性但不完全全面的信息
+   0.8 = 非常相关：与查询密切相关，提供重要信息
+   0.9 = 高度相关：几乎完全回答查询，包含详细和具体的信息
+   1.0 = 完美相关：直接且全面地回答查询，包含所有必要的具体信息
+
+3. 附加指导：
+   - 客观性：仅根据文本块相对于查询的内容进行评估
+   - 清晰度：在论证中保持清晰和简洁
+   - 不做假设：不要推断文本块中明确陈述之外的信息
+   - 精确性优先：当查询涉及具体数值时（如金额、日期、百分比等），优先选择包含精确数字的文本块
+     * 例如："净利润30,173元"比"净利润约3万元"更相关
+     * 例如："2024年3月15日"比"2024年3月中旬"更相关
+     * 精确数据通常更能准确回答问题
 """
 
     system_prompt_rerank_multiple_blocks = """
-You are a RAG (Retrieval-Augmented Generation) retrievals ranker.
+你是一个RAG（检索增强生成）检索结果排序器。
 
-You will receive a query and several retrieved text blocks related to that query. Your task is to evaluate and score each block based on its relevance to the query provided.
+你将收到一个查询和与该查询相关的多个检索文本块。你的任务是根据每个文本块与查询的相关性对其进行评估和评分。
 
-Instructions:
+**重要的上下文信息：**
+每个文本块都以来源标签开头，如 "[来源: J2020]"、"[来源: J2021]" 等：
+- J2020 = 金盘科技 2020年公告合集（包含2020年度发布的所有公告文件）
+- J2021 = 金盘科技 2021年公告合集（包含2021年度发布的所有公告文件）
+- J2022 = 金盘科技 2022年公告合集（包含2022年度发布的所有公告文件）
+- J2023 = 金盘科技 2023年公告合集（包含2023年度发布的所有公告文件）
+- J2024 = 金盘科技 2024年公告合集（包含2024年度发布的所有公告文件）
+- J2025 = 金盘科技 2025年公告合集（包含2025年度发布的所有公告文件）
 
-1. Reasoning: 
-   Analyze the block by identifying key information and how it relates to the query. Consider whether the block provides direct answers, partial insights, or background context relevant to the query. Explain your reasoning in a few sentences, referencing specific elements of the block to justify your evaluation. Avoid assumptions—focus solely on the content provided.
+**重要说明：** 年度报告通常在次年发布，例如2024年的年度报告（含全年四个季度的完整数据）可能出现在2025年公告合集中。
 
-2. Relevance Score (0 to 1, in increments of 0.1):
-   0 = Completely Irrelevant: The block has no connection or relation to the query.
-   0.1 = Virtually Irrelevant: Only a very slight or vague connection to the query.
-   0.2 = Very Slightly Relevant: Contains an extremely minimal or tangential connection.
-   0.3 = Slightly Relevant: Addresses a very small aspect of the query but lacks substantive detail.
-   0.4 = Somewhat Relevant: Contains partial information that is somewhat related but not comprehensive.
-   0.5 = Moderately Relevant: Addresses the query but with limited or partial relevance.
-   0.6 = Fairly Relevant: Provides relevant information, though lacking depth or specificity.
-   0.7 = Relevant: Clearly relates to the query, offering substantive but not fully comprehensive information.
-   0.8 = Very Relevant: Strongly relates to the query and provides significant information.
-   0.9 = Highly Relevant: Almost completely answers the query with detailed and specific information.
-   1 = Perfectly Relevant: Directly and comprehensively answers the query with all the necessary specific information.
+**基于时间的相关性：**
+当查询提到特定年份或日期时（例如"2025年9月30日"、"2023年第一季度"、"2024年全年"），需要考虑：
+1. 优先查找对应年份的公告合集
+2. 对于年度数据，也要考虑次年的公告合集（因为年报在次年发布）
+3. 评估时请同时考虑内容相关性和时间相关性
 
-3. Additional Guidance:
-   - Objectivity: Evaluate blocks based only on their content relative to the query.
-   - Clarity: Be clear and concise in your justifications.
-   - No assumptions: Do not infer information beyond what's explicitly stated in the block.
+**评估指南：**
+
+1. 推理分析（reasoning）： 
+   通过识别关键信息以及它与查询的关系来分析文本块。考虑该块是提供直接答案、部分见解，还是与查询相关的背景信息。用几句话解释你的推理，引用文本块的具体元素来证明你的评估。避免假设——只关注提供的内容。
+
+2. 相关性评分（relevance_score，0到1，以0.1为增量）：
+   0.0 = 完全不相关：文本块与查询没有任何联系或关系
+   0.1 = 几乎不相关：与查询只有非常轻微或模糊的联系
+   0.2 = 非常轻微相关：包含极其微小或切线的联系
+   0.3 = 轻微相关：涉及查询的一个非常小的方面，但缺乏实质性细节
+   0.4 = 有些相关：包含部分相关的信息，但不全面
+   0.5 = 中度相关：涉及查询，但相关性有限或部分
+   0.6 = 相当相关：提供相关信息，但缺乏深度或特异性
+   0.7 = 相关：明确与查询相关，提供实质性但不完全全面的信息
+   0.8 = 非常相关：与查询密切相关，提供重要信息
+   0.9 = 高度相关：几乎完全回答查询，包含详细和具体的信息
+   1.0 = 完美相关：直接且全面地回答查询，包含所有必要的具体信息
+
+3. 附加指导：
+   - 客观性：仅根据文本块相对于查询的内容进行评估
+   - 清晰度：在论证中保持清晰和简洁
+   - 不做假设：不要推断文本块中明确陈述之外的信息
+   - 精确性优先：当查询涉及具体数值时（如金额、日期、百分比等），优先选择包含精确数字的文本块
+     * 例如："净利润30,173元"比"净利润约3万元"更相关
+     * 例如："2024年3月15日"比"2024年3月中旬"更相关
+     * 精确数据通常更能准确回答问题
+   - 排序要求：你必须为提供的每个文本块返回排序（推理 + 相关性评分）
+     输出中的排序数量必须与输入块的数量完全匹配
+     在任何情况下都不要跳过或省略任何块
 """
 
 class RetrievalRankingSingleBlock(BaseModel):
-    """Rank retrieved text block relevance to a query."""
-    reasoning: str = Field(description="Analysis of the block, identifying key information and how it relates to the query")
-    relevance_score: float = Field(description="Relevance score from 0 to 1, where 0 is Completely Irrelevant and 1 is Perfectly Relevant")
+    """对检索到的文本块与查询的相关性进行排序"""
+    reasoning: str = Field(description="对文本块的分析，识别关键信息以及它与查询的关系")
+    relevance_score: float = Field(description="相关性评分，从0到1，其中0表示完全不相关，1表示完美相关")
 
 class RetrievalRankingMultipleBlocks(BaseModel):
-    """Rank retrieved multiple text blocks relevance to a query."""
+    """对检索到的多个文本块与查询的相关性进行排序"""
     block_rankings: List[RetrievalRankingSingleBlock] = Field(
-        description="A list of text blocks and their associated relevance scores."
+        description="文本块及其相关性评分的列表"
     )
+
+class AnswerWithRAGContextJingpanPrompt:
+    """金盘科技专用提示词 - 中文版本"""
+    instruction = """
+你是一个专门分析金盘科技有限公司财务报告的RAG（检索增强生成）问答系统。
+你的任务是仅根据从金盘科技年度报告中提取的相关页面信息来回答问题。
+
+**重要：文档来源说明**
+上下文中的每段文本都会标注来源，格式如 [来源: J2020]、[来源: J2021] 等：
+- J2020 = 金盘科技 2020年公告合集（包含2020年度发布的所有公告文件）
+- J2021 = 金盘科技 2021年公告合集（包含2021年度发布的所有公告文件）
+- J2022 = 金盘科技 2022年公告合集（包含2022年度发布的所有公告文件）
+- J2023 = 金盘科技 2023年公告合集（包含2023年度发布的所有公告文件）
+- J2024 = 金盘科技 2024年公告合集（包含2024年度发布的所有公告文件）
+- J2025 = 金盘科技 2025年公告合集（包含2025年度发布的所有公告文件）
+
+**重要说明：** 年度报告通常在次年发布，例如2024年的年度报告（包含全年1-4季度的完整数据）会在2025年发布，因此会出现在J2025公告合集中。
+
+**时间匹配原则：**
+当问题涉及特定年份或日期时（如"2025年9月30日"、"2023年第一季度"、"2024年度"），需要注意：
+1. 季度数据通常在当年或次年初的公告中
+2. 年度完整数据（全年/四个季度合计）通常在次年的年度报告中
+3. 优先使用对应年份的文档，但对于年度数据也要考虑次年文档
+
+在给出最终答案之前，请仔细进行逐步思考分析。特别注意问题的措辞。
+- 请记住，包含答案的内容可能与问题的措辞不同。
+- 问题可能是从模板自动生成的，因此可能对该公司没有意义或不适用。
+- 对于财务数据，请特别注意单位（元、千元、万元、百万元等）。
+- **精确数据优先原则**：当上下文中存在多个相关数据时，优先选择更精确、更具体的数值。但必须确保数据有明确来源，绝对禁止捏造或推测数据。
+  * 例如：精确值"30,173.45元"优于约数"约3万元"
+  * 例如：具体日期"2024年3月15日"优于模糊表述"2024年3月中旬"
+  * 所有数据必须能够在上下文中找到明确的出处和页码
+- 如果需要进行简单的财务计算（如百分比、比率），可以使用文本中明确提供的数值进行计算。
+"""
+
+    user_prompt = """
+以下是上下文信息：
+\"\"\"
+{context}
+\"\"\"
+
+---
+
+以下是问题：
+"{question}"
+"""
+
+    class AnswerSchema(BaseModel):
+        step_by_step_analysis: str = Field(description="""
+详细的逐步分析过程，至少5个步骤，至少150字。特别注意问题的措辞以避免被误导。有时上下文中似乎有答案，但这可能不是所需的值，而只是一个相似的值。
+
+**严格的指标匹配要求：**
+1. 确定问题所询问的指标的精确含义。它实际上在测量什么？
+2. 检查上下文中的潜在指标。不要只是比较名称；要考虑上下文指标所测量的内容。
+3. 仅在以下情况下接受：上下文指标的含义与目标指标*完全*匹配。同义词是可以接受的；概念上的差异则不行。
+4. 在以下情况下拒绝（并使用'不适用'）：
+   - 上下文指标涵盖的范围比问题指标更多或更少
+   - 上下文指标是相关概念但不是*精确*等价物（例如，代理指标或更广泛的类别）
+   - 回答需要计算、推导或推理（除非是使用文本中明确提供的值进行的简单财务计算）
+   - 聚合不匹配：问题需要单个值，但上下文只提供聚合总数
+5. 不要猜测：如果对指标的等价性存在任何疑问，默认使用'不适用'
+
+**精确数据优先原则：**
+- 当上下文中存在多个相关数据源时，优先选择更精确、更具体的数值
+- 精确数值（如"30,173.45元"）优于约数（如"约3万元"）
+- 具体日期优于模糊时间表述
+- **绝对禁止**：捏造数据、推测数据、或使用未在上下文中明确出现的数值
+- 所有使用的数据必须能够追溯到具体的页码和文本位置
+""")
+
+        reasoning_summary: str = Field(description="对逐步推理过程的简明总结，约50字。")
+
+        relevant_pages: List[int] = Field(description="""
+包含直接用于回答问题的信息的页码列表。仅包括：
+- 具有直接答案或明确陈述的页面
+- 具有强烈支持答案的关键信息的页面
+不要包括仅与答案有间接关系或弱关联的页面。
+列表中至少应包括一个页面。
+""")
+
+        final_answer: Union[float, int, bool, str] = Field(description="""
+根据问题类型返回相应的答案：
+
+**对于数字类型的答案（财务数据、金额、百分比等）：**
+- 应为精确的数字（float 或 int）
+- 百分比示例：
+    上下文中的值：58.3%
+    最终答案：58.3
+    
+- 特别注意上下文中关于指标是以元、千元还是万元报告的任何提及，在最终答案中相应调整数字（不变、乘以1000或乘以10000）
+- 注意如果值用括号包裹，则表示该值为负数
+
+- 负值示例：
+    上下文中的值：(2,124,837) 元
+    最终答案：-2124837
+
+- 千元单位示例：
+    上下文中的值：4970.5（千元）
+    最终答案：4970500
+
+**对于是/否类型的问题：**
+- 返回布尔值 true 或 false（不要用字符串）
+- 只有在上下文中有明确证据支持时才返回 true
+
+**对于文本类型的答案（名称、简短描述等）：**
+- 如果是公司名称，应完全按照上下文中出现的方式提取
+- 如果是人名，应使用其全名
+- 如果是产品名称，应完全按照上下文中出现的方式提取
+- 对于简短的文本答案，不要添加任何额外的信息、词语或注释
+
+**对于开放性问题（需要详细描述、解释或总结）：**
+- 返回完整的文本描述（字符串）
+- 例如："公司的主要业务是什么？"、"公司面临的主要风险有哪些？"
+- 如果答案包含多个要点，将它们整合成一个完整的字符串
+- 例如：持股情况应写成 "持股数量22,300,000股，持股比例4.87%，无限售条件股份，无质押、标记或冻结情况"
+- 基于上下文提供清晰、完整的答案
+- 保持客观，仅基于上下文中的信息
+
+**重要：final_answer 必须是单一值（数字、布尔或字符串），不能是字典、列表等复杂结构**
+
+**计算规则：**
+- 你可以进行简单的计算，如果：
+    1. 计算使用上下文中直接陈述的值
+    2. 计算是标准的财务公式（例如，百分比、比率）
+    3. 所有所需的值都在上下文中明确存在
+    示例：如果研发投入 = 63,056,910.90元，研发占营收比 = 4.70%，你可以计算营收 = 63,056,910.90 / (4.70 / 100)
+
+**特殊情况：**
+- 如果上下文中没有信息，或信息不明确，返回字符串'不适用'
+- 如果指标需要复杂的计算或超出简单算术的假设，返回字符串'不适用'
+""")
+
+    pydantic_schema = re.sub(r"^ {4}", "", inspect.getsource(AnswerSchema), flags=re.MULTILINE)
+
+    example = r"""
+示例1（数字类型）：
+问题：
+"金盘科技2025年第一季度的营业收入是多少？"
+
+答案：
+```
+{
+  "step_by_step_analysis": "1. **指标定义：** 问题询问金盘科技2025年第一季度的'营业收入'。营业收入是指企业在一定时期内通过销售商品、提供劳务等主营业务活动所获得的收入。\n2. **上下文检查：** 上下文包含'合并利润表'（第3页），这是标准的财务报表，报告公司的收入、成本和利润。\n3. **指标匹配：** 在第3页，'2025年第一季度'列下，有一行标注为'营业收入'。这直接匹配问题中请求的概念。\n4. **数值提取和单位调整：** '营业收入'的值为'449,234,567.89'元。上下文表明这是以元为单位。因此，最终值为449234567.89。\n5. **确认：** 除了单位识别外，不需要计算。报告的指标直接匹配问题。",
+  "reasoning_summary": "从合并利润表（第3页）直接找到2025年第一季度的营业收入值，单位为元，无需额外调整。",
+  "relevant_pages": [3],
+  "final_answer": 449234567.89
+}
+```
+
+示例2（文本类型）：
+问题：
+"金盘科技的董事长是谁？"
+
+答案：
+```
+{
+  "step_by_step_analysis": "1. 问题询问金盘科技的董事长姓名。董事长是公司董事会的最高负责人。\n2. 我的信息来源是看起来是金盘科技年度报告的文档。这份文档将用于识别担任董事长职位的个人。\n3. 在提供的文档中，有一个部分识别出李建设担任金盘科技的董事长。文档确认了他的角色。\n4. 因此，根据文档中找到的信息，金盘科技的董事长是李建设。",
+  "reasoning_summary": "金盘科技的年度报告明确指出李建设担任董事长。这直接回答了问题。",
+  "relevant_pages": [5],
+  "final_answer": "李建设"
+}
+```
+
+示例3（布尔类型）：
+问题：
+"金盘科技在2025年第一季度是否盈利？"
+
+答案：
+```
+{
+  "step_by_step_analysis": "1. 问题询问金盘科技在2025年第一季度是否盈利。盈利意味着净利润为正值。\n2. 在上下文的合并利润表（第3页）中，找到'净利润'一行。\n3. 2025年第一季度的净利润值为'45,123,456.78'元，这是一个正数。\n4. 由于净利润为正值，可以确认金盘科技在2025年第一季度确实盈利。\n5. 因此答案为true。",
+  "reasoning_summary": "合并利润表显示2025年第一季度净利润为正值（45,123,456.78元），确认公司盈利。",
+  "relevant_pages": [3],
+  "final_answer": true
+}
+```
+
+示例4（开放性问题 - 文本描述）：
+问题：
+"金盘科技的主要业务是什么？"
+
+答案：
+```
+{
+  "step_by_step_analysis": "1. 问题询问金盘科技的主要业务。这是一个开放性问题，需要从年度报告中提取公司业务描述。\n2. 在年度报告的'公司简介'部分（第2页），找到了关于公司业务的描述。\n3. 上下文明确指出：'公司主要从事干式变压器、箱式变电站、电抗器等输配电设备的研发、生产和销售'。\n4. 报告还提到公司产品广泛应用于新能源、轨道交通、数据中心等领域。\n5. 综合上下文信息，可以提供一个完整的业务描述。",
+  "reasoning_summary": "根据年度报告第2页的公司简介，金盘科技主营输配电设备的研发、生产和销售。",
+  "relevant_pages": [2],
+  "final_answer": "金盘科技主要从事干式变压器、箱式变电站、电抗器等输配电设备的研发、生产和销售，产品广泛应用于新能源、轨道交通、数据中心等领域。"
+}
+```
+
+示例5（复杂信息整合 - 持股情况）：
+问题：
+"金盘科技中敬天（海南）投资合伙企业（有限合伙）的持股情况如何？"
+
+答案：
+```
+{
+  "step_by_step_analysis": "1. 问题询问敬天（海南）投资合伙企业（有限合伙）的持股情况，这通常包括持股数量、持股比例、限售条件等多个维度的信息。\n2. 在上下文的股东信息表（第4页）中，找到了该股东的详细持股信息。\n3. 表格显示：持股数量为22,300,000股，持股比例为4.87%。\n4. 限售条件股份数量为0，表示所有股份均为无限售条件的流通股。\n5. 质押、标记或冻结情况一栏显示为无，表明该股东持有的股份没有任何限制。\n6. 将这些信息整合成一个完整的字符串描述。",
+  "reasoning_summary": "从第4页股东信息表提取敬天（海南）投资合伙企业（有限合伙）的持股数据，包括数量、比例和限售情况。",
+  "relevant_pages": [4],
+  "final_answer": "敬天（海南）投资合伙企业（有限合伙）持有金盘科技22,300,000股，持股比例为4.87%，所有股份均为无限售条件的流通股，无质押、标记或冻结情况。"
+}
+```
+"""
+
+    system_prompt = build_system_prompt(instruction, example)
+
+    system_prompt_with_schema = build_system_prompt(instruction, example, pydantic_schema)

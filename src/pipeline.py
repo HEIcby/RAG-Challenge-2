@@ -265,7 +265,9 @@ class Pipeline:
             parallel_requests=self.run_config.parallel_requests,
             api_provider=self.run_config.api_provider,
             answering_model=self.run_config.answering_model,
-            full_context=self.run_config.full_context            
+            full_context=self.run_config.full_context,
+            use_hyde=getattr(self.run_config, 'use_hyde', True),
+            use_multi_query=getattr(self.run_config, 'use_multi_query', True)
         )
         
         output_path = self._get_next_available_filename(self.paths.answers_file_path)
@@ -432,6 +434,45 @@ gemini_thinking_config_big_context = RunConfig(
     config_suffix="_gemini_thinking_bc"
 )
 
+qwen_config = RunConfig(
+    use_serialized_tables=False,                # 是否在预处理时对表格进行序列化，通常RAG任务用False
+    parent_document_retrieval=True,             # 是否启用Parent Document检索（提升长文档检索效果）
+    llm_reranking=True,                         # 是否用LLM对检索结果再排序（提升相关性）
+    parallel_requests=4,                       # 并发请求数，影响处理速度和API限流
+    submission_name="Qwen v.2",                 # 本次实验/提交的名称
+    pipeline_details="Qwen API + vDB + ParentDoc + rerank + SO CoT",  # 本次pipeline的主要特征描述
+    answering_model="qwen-turbo",               # Qwen使用的具体模型名（如qwen-turbo、qwen-plus等）
+    config_suffix="_qwen_v2",                   # 输出文件名后缀，便于区分不同实验
+    api_provider="qwen"                         # 关键！必须加上这一行
+    # 其它参数如top_n_retrieval、llm_reranking_sample_size等可按需补充
+)
+
+qwen_max_config = RunConfig(
+    use_serialized_tables=False,                # 是否在预处理时对表格进行序列化，通常RAG任务用False
+    parent_document_retrieval=True,             # 是否启用Parent Document检索（提升长文档检索效果）
+    llm_reranking=True,                         # 是否用LLM对检索结果再排序（提升相关性）
+    parallel_requests=4,                       # 并发请求数，影响处理速度和API限流
+    submission_name="Qwen_max v.2",                 # 本次实验/提交的名称
+    pipeline_details="Qwen_max API + vDB + ParentDoc + rerank + SO CoT",  # 本次pipeline的主要特征描述
+    answering_model="qwen-max-2025-01-25",               # Qwen使用的具体模型名（如qwen-turbo、qwen-plus等）
+    config_suffix="_qwen_max_v2",                   # 输出文件名后缀，便于区分不同实验
+    api_provider="qwen"                         # 关键！必须加上这一行
+    # 其它参数如top_n_retrieval、llm_reranking_sample_size等可按需补充
+)
+
+qwen_plus_config = RunConfig(
+    use_serialized_tables=False,                # 是否在预处理时对表格进行序列化，通常RAG任务用False
+    parent_document_retrieval=True,             # 是否启用Parent Document检索（提升长文档检索效果）
+    llm_reranking=True,                         # 是否用LLM对检索结果再排序（提升相关性）
+    parallel_requests=4,                       # 并发请求数，影响处理速度和API限流
+    submission_name="Qwen_plus v.2",                 # 本次实验/提交的名称
+    pipeline_details="Qwen_plus API + vDB + ParentDoc + rerank + SO CoT",  # 本次pipeline的主要特征描述
+    answering_model="qwen-plus-2025-07-28",               # Qwen使用的具体模型名（如qwen-turbo、qwen-plus等）
+    config_suffix="_qwen_plus_v2",                   # 输出文件名后缀，便于区分不同实验
+    api_provider="qwen"                         # 关键！必须加上这一行
+    # 其它参数如top_n_retrieval、llm_reranking_sample_size等可按需补充
+)
+
 configs = {"base": base_config,
            "pdr": parent_document_retrieval_config,
            "max": max_config, 
@@ -440,7 +481,11 @@ configs = {"base": base_config,
            "max_st_o3m": max_st_o3m_config,
            "ibm_llama70b": ibm_llama70b_config, # This one won't work, because ibm api was avaliable only while contest was running
            "ibm_llama8b": ibm_llama8b_config, # This one won't work, because ibm api was avaliable only while contest was running
-           "gemini_thinking": gemini_thinking_config}
+           "gemini_thinking": gemini_thinking_config,
+           "qwen": qwen_config,
+           "qwen_max": qwen_max_config,
+           "qwen_plus": qwen_plus_config,
+           }
 
 
 # You can run any method right from this file with 
@@ -449,7 +494,7 @@ configs = {"base": base_config,
 # You can also change the run_config to try out different configurations
 if __name__ == "__main__":
     root_path = here() / "data" / "test_set"
-    pipeline = Pipeline(root_path, run_config=max_nst_o3m_config)
+    pipeline = Pipeline(root_path, run_config=qwen_config)
     
     
     # This method parses pdf reports into a jsons. It creates jsons in the debug/data_01_parsed_reports. These jsons used in the next steps. 

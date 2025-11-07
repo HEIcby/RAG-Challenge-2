@@ -8,6 +8,7 @@ from tqdm import tqdm
 import pandas as pd
 import threading
 import concurrent.futures
+import os
 
 
 class QuestionsProcessor:
@@ -23,10 +24,15 @@ class QuestionsProcessor:
         llm_reranking_sample_size: int = 20,
         top_n_retrieval: int = 10,
         parallel_requests: int = 10,
-        api_provider: str = "openai",
+        api_provider: str = "qwen",
         answering_model: str = "gpt-4o-2024-08-06",
-        full_context: bool = False
+        full_context: bool = False,
+        use_hyde: bool = True,
+        use_multi_query: bool = True
     ):
+        print(f"[QuestionsProcessor] LLM provider: {api_provider}")
+        print(f"[QuestionsProcessor] Answering model: {answering_model}")
+        #os.environ["LLM_RERANK_MODEL"] = answering_model
         self.questions = self._load_questions(questions_file_path)
         self.documents_dir = Path(documents_dir)
         self.vector_db_dir = Path(vector_db_dir)
@@ -42,6 +48,9 @@ class QuestionsProcessor:
         self.api_provider = api_provider
         self.openai_processor = APIProcessor(provider=api_provider)
         self.full_context = full_context
+        self.use_hyde = use_hyde
+        self.use_multi_query = use_multi_query
+        #print(f"[DEBUG][QuestionsProcessor.__init__] use_hyde={self.use_hyde}, use_multi_query={self.use_multi_query}")
 
         self.answer_details = []
         self.detail_counter = 0
@@ -66,22 +75,37 @@ class QuestionsProcessor:
             
         return "\n\n---\n\n".join(context_parts)
 
-    def _extract_references(self, pages_list: list, company_name: str) -> list:
-        # Load companies data
-        if self.subset_path is None:
-            raise ValueError("subset_path is required for new challenge pipeline when processing references.")
-        self.companies_df = pd.read_csv(self.subset_path)
-
-        # Find the company's SHA1 from the subset CSV
-        matching_rows = self.companies_df[self.companies_df['company_name'] == company_name]
-        if matching_rows.empty:
-            company_sha1 = ""
-        else:
-            company_sha1 = matching_rows.iloc[0]['sha1']
-
+    def _extract_references(self, pages_list: list, company_name: str, retrieval_results: list) -> list:
+        """
+        Extract references with correct source SHA1 from retrieval results.
+        Uses actual source_sha1 from retrieval results instead of blindly taking first match from CSV.
+        """
+        # Build a mapping from page number to source_sha1
+        page_to_sha1 = {}
+        for result in retrieval_results:
+            page = result.get('page')
+            source_sha1 = result.get('source_sha1', '')
+            if page is not None and source_sha1:
+                page_to_sha1[page] = source_sha1
+        
         refs = []
         for page in pages_list:
-            refs.append({"pdf_sha1": company_sha1, "page_index": page})
+            # Get the actual source SHA1 from retrieval results
+            sha1 = page_to_sha1.get(page, '')
+            
+            # Find matching chunk text
+            chunk_text = ""
+            for result in retrieval_results:
+                if result.get('page') == page:
+                    chunk_text = result.get('text', '')
+                    break
+            
+            refs.append({
+                "pdf_sha1": sha1,
+                "page_index": page,
+                "chunk_text": chunk_text
+            })
+        
         return refs
 
     def _validate_page_references(self, claimed_pages: list, retrieval_results: list, min_pages: int = 2, max_pages: int = 8) -> list:
@@ -98,7 +122,7 @@ class QuestionsProcessor:
         
         if len(validated_pages) < len(claimed_pages):
             removed_pages = set(claimed_pages) - set(validated_pages)
-            print(f"Warning: Removed {len(removed_pages)} hallucinated page references: {removed_pages}")
+            print(f"[DEBUG] [Warning] Removed {len(removed_pages)} hallucinated page references: {removed_pages}")
         
         if len(validated_pages) < min_pages and retrieval_results:
             existing_pages = set(validated_pages)
@@ -113,52 +137,155 @@ class QuestionsProcessor:
                         break
         
         if len(validated_pages) > max_pages:
-            print(f"Trimming references from {len(validated_pages)} to {max_pages} pages")
+            print(f"[DEBUG] [Warning] Trimming references from {len(validated_pages)} to {max_pages} pages")
             validated_pages = validated_pages[:max_pages]
         
         return validated_pages
 
-    def get_answer_for_company(self, company_name: str, question: str, schema: str) -> dict:
-
+    def get_answer_for_company(self, company_name: str, question: str, schema: str, conversation_history: Optional[List[Dict]] = None, progress_callback=None) -> dict:
+        """
+        Get answer for a company's question with optional conversation history.
+        
+        Args:
+            company_name: Company name
+            question: Current question (original, without context)
+            schema: Answer schema type
+            conversation_history: Optional list of previous Q&A pairs
+                Format: [{"question": "...", "answer": "..."}, ...]
+            progress_callback: Optional callback function(stage: str, progress: int)
+        """
+        #print(f"[DEBUG][get_answer_for_company] self.use_hyde={self.use_hyde}, self.use_multi_query={self.use_multi_query}")
+        
+        # 阶段 1: 初始化检索器
+        if progress_callback:
+            progress_callback("🔍 分析问题中...", 10)
+        
         if self.llm_reranking:
             retriever = HybridRetriever(
                 vector_db_dir=self.vector_db_dir,
-                documents_dir=self.documents_dir
+                documents_dir=self.documents_dir,
+                use_hyde=self.use_hyde,
+                use_multi_query=self.use_multi_query,
+                subset_path=self.subset_path
             )
         else:
             retriever = VectorRetriever(
                 vector_db_dir=self.vector_db_dir,
-                documents_dir=self.documents_dir
+                documents_dir=self.documents_dir,
+                use_hyde=self.use_hyde,
+                use_multi_query=self.use_multi_query,
+                subset_path=self.subset_path
             )
 
+        # 阶段 2: 召回相关文档
+        if progress_callback:
+            progress_callback("📚 召回相关文档中...", 25)
+        
         if self.full_context:
             retrieval_results = retriever.retrieve_all(company_name)
-        else:           
-            retrieval_results = retriever.retrieve_by_company_name(
-                company_name=company_name,
-                query=question,
-                llm_reranking_sample_size=self.llm_reranking_sample_size,
-                top_n=self.top_n_retrieval,
-                return_parent_pages=self.return_parent_pages
-            )
+        else:
+            # 只在VectorRetriever时传递use_hyde和use_multi_query
+            # 使用原始问题进行检索（不包含对话历史）
+            if isinstance(retriever, VectorRetriever):
+                retrieval_results = retriever.retrieve_by_company_name(
+                    company_name=company_name,
+                    query=question,
+                    llm_reranking_sample_size=self.llm_reranking_sample_size,
+                    top_n=self.top_n_retrieval,
+                    return_parent_pages=self.return_parent_pages,
+                    use_hyde=self.use_hyde,
+                    use_multi_query=self.use_multi_query,
+                    progress_callback=progress_callback
+                )
+            else:
+                # HybridRetriever 也需要传递 progress_callback
+                retrieval_results = retriever.retrieve_by_company_name(
+                    company_name=company_name,
+                    query=question,
+                    llm_reranking_sample_size=self.llm_reranking_sample_size,
+                    top_n=self.top_n_retrieval,
+                    return_parent_pages=self.return_parent_pages,
+                    progress_callback=progress_callback
+                )
         
         if not retrieval_results:
             raise ValueError("No relevant context found")
         
+        # 阶段 3: 格式化检索结果
+        if progress_callback:
+            progress_callback("📝 整理检索结果中...", 70)
+        
         rag_context = self._format_retrieval_results(retrieval_results)
+        
+        # 构造带对话历史的问题（用于LLM生成答案）
+        question_with_context = self._build_contextual_question(question, conversation_history)
+        
+        # 阶段 4: 生成最终答案
+        if progress_callback:
+            progress_callback("✍️ 生成最终答案中...", 80)
+        
         answer_dict = self.openai_processor.get_answer_from_rag_context(
-            question=question,
+            question=question_with_context,
             rag_context=rag_context,
             schema=schema,
             model=self.answering_model
         )
+        
+        # 防御性检查：确保返回的是字典而不是列表
+        if isinstance(answer_dict, list):
+            print(f"[WARNING] get_answer_from_rag_context 返回了列表而不是字典: {answer_dict}")
+            # 尝试从列表中提取第一个元素，如果是字典的话
+            if answer_dict and isinstance(answer_dict[0], dict):
+                answer_dict = answer_dict[0]
+            else:
+                # 创建一个默认的错误响应
+                answer_dict = {
+                    "final_answer": "解析错误：API返回了意外的数据格式",
+                    "detailed_analysis": [],
+                    "reasoning_summary": "数据格式错误",
+                    "relevant_pages": []
+                }
+        
         self.response_data = self.openai_processor.response_data
         if self.new_challenge_pipeline:
             pages = answer_dict.get("relevant_pages", [])
             validated_pages = self._validate_page_references(pages, retrieval_results)
             answer_dict["relevant_pages"] = validated_pages
-            answer_dict["references"] = self._extract_references(validated_pages, company_name)
+            answer_dict["references"] = self._extract_references(validated_pages, company_name, retrieval_results)
         return answer_dict
+    
+    def _build_contextual_question(self, current_question: str, conversation_history: Optional[List[Dict]] = None) -> str:
+        """
+        Build a question with conversation context.
+        
+        Args:
+            current_question: The current question
+            conversation_history: List of previous Q&A pairs
+        
+        Returns:
+            Enhanced question with context
+        """
+        if not conversation_history:
+            return current_question
+        
+        # 构造历史对话上下文
+        context_parts = []
+        for h in conversation_history:
+            q = h.get('question', '')
+            a = h.get('answer', 'N/A')
+            context_parts.append(f"Q: {q}\nA: {a}")
+        
+        context_str = "\n\n".join(context_parts)
+        
+        # 构造增强问题
+        enhanced_question = f"""历史对话上下文：
+{context_str}
+
+当前问题：{current_question}
+
+请结合上述历史对话的背景信息回答当前问题。如果当前问题使用了指代词（如"它"、"这个"、"该公司"等）或需要对比分析，请参考历史对话内容进行理解和回答。"""
+        
+        return enhanced_question
 
     def _extract_companies_from_subset(self, question_text: str) -> list[str]:
         """Extract company names from a question by matching against companies in the subset file."""
@@ -170,18 +297,26 @@ class QuestionsProcessor:
         found_companies = []
         company_names = sorted(self.companies_df['company_name'].unique(), key=len, reverse=True)
         
+        #print(f"[DEBUG] Trying to match company in question:{question_text}")
         for company in company_names:
             escaped_company = re.escape(company)
-            
             pattern = rf'{escaped_company}(?:\W|$)'
-            
             if re.search(pattern, question_text, re.IGNORECASE):
+                #print(f"[DEBUG] Matched company: '{company}' in question: {question_text}")
                 found_companies.append(company)
                 question_text = re.sub(pattern, '', question_text, flags=re.IGNORECASE)
         
         return found_companies
 
-    def process_question(self, question: str, schema: str):
+    def process_question(self, question: str, schema: str, conversation_history: Optional[List[Dict]] = None):
+        """
+        Process a question with optional conversation history.
+        
+        Args:
+            question: The question to process
+            schema: Answer schema type
+            conversation_history: Optional list of previous Q&A pairs
+        """
         if self.new_challenge_pipeline:
             extracted_companies = self._extract_companies_from_subset(question)
         else:
@@ -192,7 +327,12 @@ class QuestionsProcessor:
         
         if len(extracted_companies) == 1:
             company_name = extracted_companies[0]
-            answer_dict = self.get_answer_for_company(company_name=company_name, question=question, schema=schema)
+            answer_dict = self.get_answer_for_company(
+                company_name=company_name, 
+                question=question, 
+                schema=schema,
+                conversation_history=conversation_history
+            )
             return answer_dict
         else:
             return self.process_comparative_question(question, extracted_companies, schema)
@@ -244,6 +384,7 @@ class QuestionsProcessor:
                 processed_questions.append(processed_question)
                 if output_path:
                     self._save_progress(processed_questions, output_path, submission_file=submission_file, team_email=team_email, submission_name=submission_name, pipeline_details=pipeline_details)
+                print("\n")
         else:
             with tqdm(total=total_questions, desc="Processing questions") as pbar:
                 for i in range(0, total_questions, parallel_threads):
@@ -267,22 +408,26 @@ class QuestionsProcessor:
 
     def _process_single_question(self, question_data: dict) -> dict:
         question_index = question_data.get("_question_index", 0)
-        
-        if self.new_challenge_pipeline:
-            question_text = question_data.get("text")
-            schema = question_data.get("kind")
-        else:
-            question_text = question_data.get("question")
-            schema = question_data.get("schema")
+
+        # 兼容新旧格式，优先取非空字段
+        question_text = question_data.get("question") or question_data.get("text")
+        schema = question_data.get("schema") or question_data.get("kind")
+
+        # 跳过无效问题
+        if not isinstance(question_text, str) or not question_text.strip():
+            print(f"[WARNING] Skipping invalid question: {question_text}")
+            return {"error": "Invalid question text", "question": question_text, "schema": schema}
+
         try:
             answer_dict = self.process_question(question_text, schema)
-            
+
             if "error" in answer_dict:
                 detail_ref = self._create_answer_detail_ref({
                     "step_by_step_analysis": None,
                     "reasoning_summary": None,
                     "relevant_pages": None
                 }, question_index)
+                # 保持原有分支逻辑
                 if self.new_challenge_pipeline:
                     return {
                         "question_text": question_text,
@@ -367,6 +512,7 @@ class QuestionsProcessor:
         3. Format answers according to submission schema
         4. Include step_by_step_analysis from answer details
         """
+        #print(f"[DEBUG] Post-process references")
         submission_answers = []
         
         for q in processed_questions:
@@ -384,16 +530,19 @@ class QuestionsProcessor:
                         step_by_step_analysis = self.answer_details[index].get("step_by_step_analysis")
                 except (ValueError, IndexError):
                     pass
-            
-            # Clear references if value is N/A
-            if value == "N/A":
+
+
+            # DON'T Clear references if value is N/A
+            if value == "N/A" and False:
                 references = []
             else:
-                # Convert page indices from one-based to zero-based (competition requires 0-based page indices, but for debugging it is easier to use 1-based)
+                # Convert page indices from one-based to zero-based,并保留chunk_text字段
+                
                 references = [
                     {
                         "pdf_sha1": ref["pdf_sha1"],
-                        "page_index": ref["page_index"] - 1
+                        "page_index": ref["page_index"] - 1,
+                        "chunk_text": ref.get("chunk_text", "")
                     }
                     for ref in references
                 ]
@@ -413,6 +562,7 @@ class QuestionsProcessor:
         return submission_answers
 
     def _save_progress(self, processed_questions: List[dict], output_path: Optional[str], submission_file: bool = False, team_email: str = "", submission_name: str = "", pipeline_details: str = ""):
+        #print(f"[DEBUG] Save progress to {output_path}")
         if output_path:
             statistics = self._calculate_statistics(processed_questions)
             

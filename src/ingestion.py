@@ -6,7 +6,6 @@ from pathlib import Path
 from tqdm import tqdm
 
 from dotenv import load_dotenv
-from openai import OpenAI
 from rank_bm25 import BM25Okapi
 import faiss
 import numpy as np
@@ -51,32 +50,30 @@ class BM25Ingestor:
 
 class VectorDBIngestor:
     def __init__(self):
-        self.llm = self._set_up_llm()
-
-    def _set_up_llm(self):
-        load_dotenv()
-        llm = OpenAI(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            timeout=None,
-            max_retries=2
-        )
-        return llm
+        from src.api_requests import BaseQwenProcessor
+        self.qwen = BaseQwenProcessor()
 
     @retry(wait=wait_fixed(20), stop=stop_after_attempt(2))
-    def _get_embeddings(self, text: Union[str, List[str]], model: str = "text-embedding-3-large") -> List[float]:
+    def _get_embeddings(self, text: Union[str, List[str]], model: str = "text-embedding-v4") -> List[List[float]]:
         if isinstance(text, str) and not text.strip():
             raise ValueError("Input text cannot be an empty string.")
         
-        if isinstance(text, list):
-            text_chunks = [text[i:i + 1024] for i in range(0, len(text), 1024)]
-        else:
+        # 如果输入是字符串 → 包装成列表
+        if isinstance(text, str):
             text_chunks = [text]
+        else:
+            text_chunks = text
+
 
         embeddings = []
-        for chunk in text_chunks:
-            response = self.llm.embeddings.create(input=chunk, model=model)
-            embeddings.extend([embedding.embedding for embedding in response.data])
-        
+        print(f"[DEBUG] model is :{model}")
+        # 每次处理 100 条
+        for i in range(0, len(text_chunks), 100):
+            batch = text_chunks[i:i + 100]
+            #print("[DEBUG] Sending batch for embeddings:", batch)
+            response = self.qwen.get_embeddings(texts=batch, model=model)
+            embeddings.extend([item["embedding"] for item in response])
+
         return embeddings
 
     def _create_vector_db(self, embeddings: List[float]):

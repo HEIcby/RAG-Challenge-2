@@ -1,0 +1,35 @@
+# GPU 加速版本的依赖
+# 使用方法: pip install -r requirements-gpu.txt
+
+# 核心依赖（与 requirements.txt 相同）
+aiohttp==3.10.10
+tiktoken==0.8.0
+python-dotenv==1.0.1
+pydantic==2.9.2
+openai==1.51.2
+requests==2.32.3
+tqdm==4.66.5
+rank-bm25==0.2.2
+tabulate==0.9.0
+docling==2.14.0
+pyprojroot==0.3.0
+PyPDF2==3.0.1
+langchain==0.3.3
+json_repair==0.35.0
+click==8.1.7
+httpx==0.27.2
+
+# 🚀 GPU 加速依赖
+# 替换 faiss-cpu 为 faiss-gpu
+faiss-gpu==1.9.0.post1
+
+# PyTorch GPU 版本 (根据你的 CUDA 版本选择)
+# CUDA 11.8:
+# torch==2.1.0+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
+# torchvision==0.16.0+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
+
+# CUDA 12.1:
+# torch==2.1.0+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
+# torchvision==0.16.0+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
+
+# Google Colab 已预装 PyTorch GPU，无需额外安装
