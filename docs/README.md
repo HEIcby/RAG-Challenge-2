@@ -53,8 +53,17 @@
 |------|------|----------|------|
 | USER_GUIDE.md | docs/ | 2024-11-06 | 用户使用手册 |
 | DEPLOYMENT_GUIDE.md | docs/deployment/ | 2025-11-10 | 部署指南 ⭐ |
+| **DEPLOYMENT_10.222.4.30.md** | **docs/** | **2025-11-10** | **生产服务器部署记录** 🆕 |
 | LESSONS_LEARNED.md | docs/development/ | 2025-11-07 | 经验总结 |
 | PROJECT_STRUCTURE.md | docs/development/ | 2024-11-06 | 项目结构 |
+
+### 🆕 新增文档
+
+- **[DEPLOYMENT_10.222.4.30.md](DEPLOYMENT_10.222.4.30.md)** - 详细记录了实际服务器（10.222.4.30）的完整部署过程，包括：
+  - 遇到的所有问题和解决方案
+  - 性能数据和资源使用情况
+  - 维护命令和调试技巧
+  - 138分钟完整部署时间线
 
 ---
 

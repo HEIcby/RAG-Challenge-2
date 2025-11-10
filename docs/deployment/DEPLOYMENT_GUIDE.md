@@ -414,20 +414,140 @@ tmux attach -t streamlit
 
 ## 🔧 故障排查
 
-### 端口被占用
+### 常见问题与解决方案
+
+#### 问题 1: ModuleNotFoundError: No module named 'rank_bm25'
+
+**错误信息**:
+```python
+ModuleNotFoundError: No module named 'rank_bm25'
+  File "src/retrieval.py", line 4, in <module>
+    from rank_bm25 import BM25Okapi
+```
+
+**原因**: `rank_bm25` 依赖未安装或 requirements.txt 中缺失
+
+**解决方案**:
+```bash
+# 激活虚拟环境
+source venv_streamlit/bin/activate
+
+# 安装缺失的包
+pip install rank-bm25
+
+# 或使用清华镜像加速
+pip install rank-bm25 -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+```
+
+#### 问题 2: OSError: [Errno 28] No space left on device
+
+**错误信息**:
+```
+OSError: [Errno 28] No space left on device
+```
+
+**原因**: 磁盘空间不足，通常是因为：
+- 依赖包过大（如 torch, docling）
+- 临时文件占用空间
+- 备份文件累积
+
+**解决方案**:
+```bash
+# 1. 检查磁盘使用情况
+df -h
+du -sh /root/* | sort -h
+
+# 2. 清理不必要的备份
+rm -rf /root/*_backup_*
+
+# 3. 清理 pip 缓存
+pip cache purge
+
+# 4. 清理临时文件
+rm -rf /tmp/*
+
+# 5. 只安装必需依赖（跳过 docling 等大型包）
+pip install aiohttp tiktoken python-dotenv pydantic openai \
+    requests tqdm rank-bm25 tabulate pyprojroot PyPDF2 \
+    faiss-cpu langchain json_repair click httpx PyMuPDF \
+    -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+```
+
+**预防措施**:
+- 确保至少有 20GB 可用空间
+- 定期清理日志和缓存
+- 避免安装非必需的大型依赖
+
+#### 问题 3: bash: rsync: command not found
+
+**错误信息**:
+```bash
+bash: line 1: rsync: command not found
+```
+
+**原因**: Debian 服务器默认未安装 rsync
+
+**解决方案 A**: 安装 rsync
+```bash
+sudo apt update
+sudo apt install rsync -y
+```
+
+**解决方案 B**: 使用 tar 压缩传输（推荐）
+```bash
+# 本地压缩
+cd data
+tar czf val_set.tar.gz val_set/
+
+# 上传
+scp val_set.tar.gz root@server:/path/to/data/
+
+# 服务器解压
+tar xzf val_set.tar.gz
+rm val_set.tar.gz
+```
+
+**性能对比**:
+- rsync: 适合增量同步，但需要双方都安装
+- tar + scp: 适合首次全量传输，压缩比 3.5:1
+
+#### 问题 4: 依赖安装速度慢
+
+**症状**: pip install 速度很慢（<100KB/s）
+
+**原因**: 使用默认的 PyPI 源
+
+**解决方案**:
+```bash
+# 使用清华镜像源（推荐）
+pip install <package> -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+
+# 或永久配置
+pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+
+# 阿里云镜像（备选）
+pip install <package> -i https://mirrors.aliyun.com/pypi/simple/
+```
+
+**速度提升**: 从 1-5MB/s 提升到 30-50MB/s
+
+#### 问题 5: 端口被占用
 
 ```bash
 # 查看端口占用
 sudo lsof -i :8501
 
-# 或使用 netstat
-sudo netstat -tulpn | grep 8501
+# 或使用 ss（推荐）
+ss -tlnp | grep 8501
 
 # 杀死进程
+pkill -f 'streamlit run app_jinpan_qa.py'
+
+# 或使用 PID
 sudo kill -9 <PID>
 ```
 
-### 防火墙问题
+#### 问题 6: 防火墙问题
 
 ```bash
 # 检查防火墙状态
@@ -435,9 +555,12 @@ sudo ufw status
 
 # 允许端口
 sudo ufw allow 8501/tcp
+
+# 检查 iptables
+sudo iptables -L -n | grep 8501
 ```
 
-### 权限问题
+#### 问题 7: 权限问题
 
 ```bash
 # 确保有执行权限
@@ -445,20 +568,51 @@ chmod +x scripts/start_frontend.sh
 
 # 确保数据目录可写
 chmod -R 755 data/
+
+# 检查虚拟环境权限
+ls -la venv_streamlit/bin/python
 ```
 
 ### 查看日志
 
 ```bash
-# Streamlit 日志
-tail -f ~/.streamlit/logs/*.log
+# Streamlit 应用日志
+tail -f streamlit.log
 
-# systemd 日志
+# 最近 100 行
+tail -100 streamlit.log
+
+# 搜索错误
+grep -i error streamlit.log
+
+# systemd 日志（如果使用 systemd）
 sudo journalctl -u streamlit -f --since "1 hour ago"
 
-# Nginx 日志
+# Nginx 日志（如果使用 Nginx）
 sudo tail -f /var/log/nginx/access.log
 sudo tail -f /var/log/nginx/error.log
+```
+
+### 调试技巧
+
+```bash
+# 1. 检查 Python 环境
+which python
+python --version
+
+# 2. 检查依赖安装
+pip list | grep streamlit
+pip list | grep rank-bm25
+
+# 3. 测试 API 连接
+python -c "import openai; print('OpenAI installed')"
+
+# 4. 验证端口监听
+curl -I http://localhost:8501
+
+# 5. 查看进程资源占用
+ps aux | grep streamlit
+top -p $(pgrep -f streamlit)
 ```
 
 ---
@@ -550,12 +704,31 @@ proxy_cache_valid 200 1h;
 ## 🆘 获取帮助
 
 如果遇到问题：
-1. 查看日志文件
-2. 检查防火墙和端口
-3. 确认所有依赖已安装
-4. 验证 API 密钥配置
+1. 查看 [故障排查](#故障排查) 部分
+2. 检查日志文件（`streamlit.log`）
+3. 查看 [实战部署案例](#实战部署案例)
+4. 在 GitHub 提交 Issue
+
+---
+
+## 📖 实战部署案例
+
+### 10.222.4.30 服务器部署实录
+
+查看完整的生产服务器部署过程：  
+👉 **[DEPLOYMENT_10.222.4.30.md](../DEPLOYMENT_10.222.4.30.md)**
+
+包含内容：
+- ✅ 完整的138分钟部署时间线
+- 🐛 7个实际遇到的问题和解决方案
+- 📊 磁盘空间、数据传输等性能数据
+- 🔧 维护命令和调试技巧
+- 💡 关键经验总结
+
+**推荐阅读**: 在部署前先阅读实战案例，可以避免大部分常见问题。
 
 ---
 
 **部署日期**: 2025-11-06  
+**最后更新**: 2025-11-10  
 **维护者**: Ocean Chen
