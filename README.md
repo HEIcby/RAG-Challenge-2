@@ -1,14 +1,34 @@
-# 金盘科技 RAG 智能问答系统
+# 🚀 金盘科技 RAG 智能问答系统
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Streamlit](https://img.shields.io/badge/streamlit-1.51+-red.svg)](https://streamlit.io)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Streamlit](https://img.shields.io/badge/streamlit-1.28+-red.svg)](https://streamlit.io)
 
-> 基于 RAG Challenge 获奖方案的企业级年报问答系统  
-> 支持金盘科技 2020-2025 年度财务报告智能检索与问答
+> 基于 RAG (检索增强生成) 技术的企业智能问答系统  
+> 专为金盘科技 2020-2025 年度财务报告打造
 
 **原项目**: [RAG Challenge Winner Solution](https://github.com/IlyaRice/RAG-Challenge-2)  
 **技术博客**: [英文](https://abdullin.com/ilya/how-to-build-best-rag/) | [俄文](https://habr.com/ru/articles/893356/)
+
+---
+
+## 📖 快速导航
+
+### 🎯 **用户文档**
+- 📘 **[用户指南](docs/USER_GUIDE.md)** - Streamlit 前端使用说明
+- ⚡ **[快速部署](docs/deployment/DEPLOYMENT_QUICK.md)** - 5分钟快速上手
+
+### 👨‍💻 **开发文档**
+- 🏗️ **[项目结构](docs/development/PROJECT_STRUCTURE.md)** - 代码组织与架构
+- 💡 **[开发经验](docs/development/LESSONS_LEARNED.md)** - 核心技术与最佳实践
+
+### 🚢 **部署文档**
+- 📦 **[完整部署指南](docs/deployment/DEPLOYMENT.md)** - 服务器部署详细步骤
+- ⚙️ **[部署配置](deploy_config.sh)** - 部署参数配置
+
+### 📂 **其他资源**
+- 📚 **[文档中心](docs/README.md)** - 所有文档索引
+- 🗂️ **[历史归档](docs/archives/)** - 开发过程记录
 
 ---
 

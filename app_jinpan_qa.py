@@ -29,6 +29,31 @@ sys.path.insert(0, str(root_dir))
 
 from src.questions_processing import QuestionsProcessor
 
+# 加载 subset.csv 映射（SHA1 -> 文档信息）
+@st.cache_data
+def load_document_mapping(subset_path: str) -> dict:
+    """
+    加载 subset.csv，建立 SHA1 -> {company_name, year} 的映射
+    """
+    import csv
+    mapping = {}
+    try:
+        with open(subset_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                sha1 = row.get('sha1', '')
+                company_name = row.get('company_name', '')
+                year = row.get('year', '')
+                if sha1:
+                    mapping[sha1] = {
+                        'company_name': company_name,
+                        'year': year,
+                        'display_name': f"{company_name} {year}年报" if year else company_name
+                    }
+    except Exception as e:
+        st.error(f"加载 subset.csv 失败: {e}")
+    return mapping
+
 # 页面配置
 st.set_page_config(
     page_title="金盘科技 RAG 问答系统",
@@ -40,6 +65,11 @@ st.set_page_config(
 # 自定义CSS
 st.markdown("""
     <style>
+    /* 增加侧边栏宽度 */
+    [data-testid="stSidebar"] {
+        min-width: 400px;
+        max-width: 450px;
+    }
     .main {
         padding: 0rem 1rem;
     }
@@ -152,14 +182,17 @@ def initialize_system():
                 subset_path=subset_path,
                 parent_document_retrieval=False,
                 llm_reranking=config['llm_reranking'],
-                llm_reranking_sample_size=50 if config['llm_reranking'] else 10,
+                llm_reranking_sample_size=config.get('rerank_sample_size', 50),
                 top_n_retrieval=config['top_n_retrieval'],
                 parallel_requests=1,
                 api_provider=config['api_provider'],
                 answering_model=config['answering_model'],
                 full_context=False,
                 use_hyde=config['use_hyde'],
-                use_multi_query=config['use_multi_query']
+                use_multi_query=config['use_multi_query'],
+                expand_upstream=config.get('expand_upstream', False),
+                expand_top_k=config.get('expand_top_k', 5),
+                expand_context_size=config.get('expand_context_size', 2)
             )
             
             st.session_state.processor = processor
@@ -230,7 +263,7 @@ def format_answer_display(answer_dict: dict):
                 unsafe_allow_html=True)
     
     # 创建标签页
-    tab1, tab2, tab3 = st.tabs(["🔍 分析过程", "📝 推理总结", "📚 参考来源"])
+    tab1, tab2, tab3, tab4 = st.tabs(["🔍 分析过程", "📝 推理总结", "📚 LLM选用的参考", "🗂️ 所有检索结果"])
     
     with tab1:
         if "step_by_step_analysis" in answer_dict:
@@ -253,6 +286,49 @@ def format_answer_display(answer_dict: dict):
         if "references" in answer_dict and answer_dict["references"]:
             refs = answer_dict["references"]
             
+            # 加载文档映射
+            doc_mapping = load_document_mapping("data/val_set/subset.csv")
+            
+            # 统计核心页面和扩充页面
+            core_count = sum(1 for ref in refs if not ref.get('is_expanded', False))
+            expanded_count = sum(1 for ref in refs if ref.get('is_expanded', False))
+            
+            st.markdown(f"### 📚 LLM选用的参考资料")
+            
+            # 检查是否使用上游扩充
+            if "selected_groups" in answer_dict:
+                # 上游扩充模式：显示组合信息
+                selected_groups = answer_dict["selected_groups"]
+                st.caption(f"🔄 使用上游扩充模式 | 选用 {len(selected_groups)} 个页面组合 | 共 {len(refs)} 页（核心页: {core_count}，扩充页: {expanded_count}）")
+                
+                # 显示每个组合
+                for group_idx, group in enumerate(selected_groups, 1):
+                    core_page = group['core_page']
+                    core_score = group['core_score']
+                    pages = group['pages']
+                    
+                    with st.expander(f"📦 组合 {group_idx}: 核心页 {core_page} (得分: {core_score:.4f}) - 包含 {len(pages)} 页", expanded=(group_idx == 1)):
+                        st.info(f"📄 页面范围: {pages[0]} - {pages[-1]} | 核心页: {core_page} | 组合得分: {core_score:.4f}")
+                        
+                        # 显示组合中的页面
+                        group_refs = [r for r in refs if r['page_index'] in pages]
+                        for ref in group_refs:
+                            page_num = ref['page_index']
+                            is_core = not ref.get('is_expanded', False)
+                            doc_sha1 = ref.get('pdf_sha1', '')
+                            
+                            if is_core:
+                                badge = '⭐ 核心页'
+                                color = '#28a745'
+                            else:
+                                badge = '📍 扩充页'
+                                color = '#007bff'
+                            
+                            st.markdown(f'<span style="background-color: {color}; color: white; padding: 2px 6px; border-radius: 3px; font-size: 0.8em;">{badge}</span> 第 {page_num} 页', unsafe_allow_html=True)
+            else:
+                # 下游扩充模式：原有显示
+                st.caption(f"✅ 核心引用: {core_count}个 | 📍 扩充页面: {expanded_count}个（自动添加相邻页面）")
+            
             # 按文档分组并按页码排序
             from collections import defaultdict
             doc_groups = defaultdict(list)
@@ -260,26 +336,67 @@ def format_answer_display(answer_dict: dict):
                 sha1 = ref.get("pdf_sha1", "")
                 page = ref.get("page_index", "N/A")
                 chunk_text = ref.get("chunk_text", "")
+                is_expanded = ref.get("is_expanded", False)
+                group_id = ref.get("group_id")
+                core_page = ref.get("core_page")
+                group_score = ref.get("group_score")
                 if sha1 and page != "N/A":
                     doc_groups[sha1].append({
                         'page': page,
-                        'text': chunk_text
+                        'text': chunk_text,
+                        'is_expanded': is_expanded,
+                        'group_id': group_id,
+                        'core_page': core_page,
+                        'group_score': group_score
                     })
             
             # 按文档显示，每个文档内部按页码排序
             for doc_sha1, pages_data in doc_groups.items():
+                # 获取文档显示名称
+                doc_info = doc_mapping.get(doc_sha1, {})
+                doc_display_name = doc_info.get('display_name', doc_sha1)
+                
                 # 按页码排序
                 pages_data.sort(key=lambda x: x['page'])
                 
+                # 统计该文档的核心和扩充页面数
+                doc_core = sum(1 for p in pages_data if not p['is_expanded'])
+                doc_expanded = sum(1 for p in pages_data if p['is_expanded'])
+                
                 # 显示文档标题
-                st.markdown(f"### 📄 文档 {doc_sha1[:8]}... ({len(pages_data)}个引用)")
+                st.markdown(f"### 📄 {doc_display_name}")
+                st.caption(f"核心引用: {doc_core}个 | 扩充页面: {doc_expanded}个 | 共 {len(pages_data)} 页")
                 
                 # 为每个页码显示图片和文本
                 for idx, page_data in enumerate(pages_data, 1):
                     page_num = page_data['page']
                     chunk_text = page_data['text']
+                    is_expanded = page_data['is_expanded']
+                    group_id = page_data.get('group_id')
+                    core_page = page_data.get('core_page')
+                    group_score = page_data.get('group_score')
                     
-                    with st.expander(f"引用 {idx}: 页码 {page_num}", expanded=(idx == 1)):
+                    # 根据是否扩充页面使用不同的图标和标签
+                    if is_expanded:
+                        icon = "📍"
+                        badge = '<span style="background-color: #007bff; color: white; padding: 2px 8px; border-radius: 3px; font-size: 0.85em;">📍 相邻扩充</span>'
+                        if group_id is not None and core_page is not None:
+                            group_info = f" | 组合 {group_id + 1}（核心页: {core_page}）"
+                        else:
+                            group_info = ""
+                    else:
+                        icon = "✅"
+                        badge = '<span style="background-color: #28a745; color: white; padding: 2px 8px; border-radius: 3px; font-size: 0.85em; font-weight: bold;">✅ LLM核心引用</span>'
+                        if group_score is not None:
+                            group_info = f" | 组合得分: {group_score:.4f}"
+                        else:
+                            group_info = ""
+                    
+                    with st.expander(f"{icon} 引用 {idx}: 第 {page_num} 页{group_info}", expanded=(idx == 1 and not is_expanded)):
+                        # 显示页面类型标签
+                        st.markdown(badge, unsafe_allow_html=True)
+                        st.markdown("")  # 空行
+                        
                         # 构建PDF路径
                         pdf_path = Path("data/val_set/pdf_reports") / f"{doc_sha1}.pdf"
                         
@@ -307,6 +424,157 @@ def format_answer_display(answer_dict: dict):
         # 显示源文档SHA1
         if "source_sha1" in answer_dict:
             st.markdown(f"**📄 主要来源:** `{answer_dict['source_sha1']}`")
+    
+    with tab4:
+        # 显示所有检索到的chunks
+        if "all_retrieved_chunks" in answer_dict and answer_dict["all_retrieved_chunks"]:
+            all_chunks = answer_dict["all_retrieved_chunks"]
+            
+            # 加载文档映射
+            doc_mapping = load_document_mapping("data/val_set/subset.csv")
+            
+            st.markdown(f"### 🔎 检索到 {len(all_chunks)} 个相关文本块")
+            st.caption("✨ 标记为 **LLM选用** 的是模型最终引用的文本块")
+            
+            # 统计信息
+            llm_selected_count = sum(1 for chunk in all_chunks if chunk.get('selected_by_llm', False))
+            
+            # 判断是否使用了重排序（如果有combined_score则使用了重排序）
+            has_reranking = any(chunk.get('combined_score') is not None for chunk in all_chunks)
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("总检索数", len(all_chunks))
+            with col2:
+                st.metric("LLM选用", llm_selected_count, delta=f"{llm_selected_count}/{len(all_chunks)}")
+            with col3:
+                if has_reranking:
+                    # 过滤掉 None 值，只计算有效的 combined_score
+                    valid_scores = [chunk.get('combined_score', 0) for chunk in all_chunks if chunk.get('combined_score') is not None]
+                    avg_combined = sum(valid_scores) / len(valid_scores) if valid_scores else 0
+                    st.metric("平均组合得分", f"{avg_combined:.4f}")
+                else:
+                    # 过滤掉 None 值，只计算有效的 vector_score
+                    valid_scores = [chunk.get('vector_score', 0) for chunk in all_chunks if chunk.get('vector_score') is not None]
+                    avg_vector = sum(valid_scores) / len(valid_scores) if valid_scores else 0
+                    st.metric("平均向量得分", f"{avg_vector:.4f}")
+            with col4:
+                if has_reranking:
+                    st.info("✅ 使用了LLM重排序")
+                else:
+                    st.info("📊 纯向量检索")
+            
+            st.markdown("---")
+            
+            # 按得分排序显示
+            for chunk in all_chunks:
+                rank = chunk.get('rank', 0)
+                page = chunk.get('page', 'N/A')
+                source_sha1 = chunk.get('source_sha1', '')
+                text = chunk.get('text', '')
+                vector_score = chunk.get('vector_score', 0.0)
+                relevance_score = chunk.get('relevance_score', None)
+                combined_score = chunk.get('combined_score', None)
+                reasoning = chunk.get('reasoning', '')
+                selected = chunk.get('selected_by_llm', False)
+                is_expanded = chunk.get('is_expanded', False)  # 是否为扩充的相邻页面
+                
+                # 获取文档显示名称
+                doc_info = doc_mapping.get(source_sha1, {})
+                doc_display_name = doc_info.get('display_name', source_sha1)
+                
+                # 根据页面状态，使用不同的样式
+                if selected:
+                    icon = "⭐"
+                    badge = '<span style="background-color: #28a745; color: white; padding: 2px 8px; border-radius: 3px; font-size: 0.85em; font-weight: bold;">✅ LLM核心引用</span>'
+                    border_color = "#28a745"
+                elif is_expanded:
+                    icon = "📍"
+                    badge = '<span style="background-color: #007bff; color: white; padding: 2px 8px; border-radius: 3px; font-size: 0.85em;">📍 相邻扩充</span>'
+                    border_color = "#007bff"
+                else:
+                    icon = "📄"
+                    badge = '<span style="background-color: #6c757d; color: white; padding: 2px 8px; border-radius: 3px; font-size: 0.85em;">未选用</span>'
+                    border_color = "#dee2e6"
+                
+                # 构建显示的得分信息
+                if combined_score is not None:
+                    score_display = f"组合得分: {combined_score:.4f}"
+                else:
+                    score_display = f"向量得分: {vector_score:.4f}"
+                
+                # 标记文本
+                status_text = ""
+                if selected:
+                    status_text = "⭐"
+                elif is_expanded:
+                    status_text = "📍"
+                
+                # 显示每个chunk
+                with st.expander(
+                    f"{icon} 排名 #{rank} - {doc_display_name} 第{page}页 - {score_display} {status_text}",
+                    expanded=(rank == 1 and selected)
+                ):
+                    # 顶部信息栏
+                    st.markdown(f"""
+                    <div style="background-color: #f8f9fa; padding: 10px; border-radius: 5px; margin-bottom: 10px; border-left: 4px solid {border_color};">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <div>
+                                <strong>📁 文档:</strong> {doc_display_name} | 
+                                <strong>📄 页码:</strong> {page} |
+                                <strong>🏆 排名:</strong> #{rank}
+                            </div>
+                            <div>
+                                {badge}
+                            </div>
+                        </div>
+                        <div style="margin-top: 8px; font-size: 0.9em;">
+                            <strong>🔗 SHA1:</strong> <code>{source_sha1}</code>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # 详细得分构成
+                    st.markdown("**📊 得分详情:**")
+                    score_cols = st.columns(3)
+                    with score_cols[0]:
+                        st.metric("向量相似度", f"{vector_score:.6f}", help="基于嵌入向量的语义相似度得分（越高越相似）")
+                    with score_cols[1]:
+                        if relevance_score is not None:
+                            st.metric("LLM相关性", f"{relevance_score:.6f}", help="LLM判断的相关性得分（0-1之间）")
+                        else:
+                            st.metric("LLM相关性", "未使用", help="未启用LLM重排序")
+                    with score_cols[2]:
+                        if combined_score is not None:
+                            st.metric("组合得分", f"{combined_score:.6f}", help="向量得分与LLM得分的加权组合")
+                        else:
+                            st.metric("组合得分", "未使用", help="未启用LLM重排序")
+                    
+                    # LLM推理过程（如果有）
+                    if reasoning and selected:
+                        st.markdown("**🤔 LLM推理过程:**")
+                        st.info(reasoning)
+                    
+                    # PDF预览（如果是LLM选用的）
+                    if selected:
+                        pdf_path = Path("data/val_set/pdf_reports") / f"{source_sha1}.pdf"
+                        if pdf_path.exists():
+                            st.markdown("**📖 PDF页面预览:**")
+                            page_image = get_pdf_page_image(str(pdf_path), page - 1)
+                            if page_image:
+                                st.image(page_image, use_container_width=True, caption=f"{doc_display_name} - 第{page}页")
+                    
+                    # 文本内容
+                    st.markdown("**📝 文本内容:**")
+                    st.text_area(
+                        "文本",
+                        text,
+                        height=150,
+                        key=f"chunk_{rank}_{page}_{source_sha1}",
+                        label_visibility="collapsed"
+                    )
+        else:
+            st.info("无检索结果信息")
 
 def save_history():
     """保存问答历史"""
@@ -361,6 +629,24 @@ def prepare_conversation_history(max_turns: int) -> list:
 with st.sidebar:
     st.title("⚙️ 系统配置")
     
+    # 显示推荐配置提示
+    with st.expander("✨ 当前配置 - 推荐配置", expanded=False):
+        st.markdown("""
+        **🎯 推荐设置（已应用）**
+        
+        ✅ 检索数量：10  
+        ✅ HYDE：开启  
+        ✅ Multi-Query：开启  
+        ✅ LLM重排序：开启  
+        ✅ 初始召回：50  
+        ✅ 上游扩充：开启  
+        ✅ 核心页面：5  
+        ✅ 扩充页数：上下各2页  
+        ✅ 多轮对话：关闭  
+        
+        💡 这些配置在大多数场景下效果最佳
+        """)
+    
     # 初始化默认配置
     if 'config' not in st.session_state:
         st.session_state.config = {
@@ -369,7 +655,8 @@ with st.sidebar:
             'top_n_retrieval': 10,
             'use_hyde': True,  # ✅ 已改用 Qwen API
             'use_multi_query': True,  # ✅ 已改用 Qwen API
-            'llm_reranking': True
+            'llm_reranking': True,
+            'rerank_sample_size': 50
         }
     
     st.markdown("---")
@@ -401,37 +688,102 @@ with st.sidebar:
     )
     
     st.markdown("---")
-    st.subheader("🔍 检索配置")
+    
+    st.markdown("### ⚙️ 基础检索")
     
     top_n_retrieval = st.slider(
-        "检索数量",
+        "📊 最终检索数量",
         min_value=5,
         max_value=30,
         value=10,
         step=5,
-        help="每次检索返回的文档块数量"
+        help="经过重排序后最终返回给LLM的文档块数量"
     )
     
+    st.markdown("---")
+    st.markdown("### 🚀 检索增强")
+    
     use_hyde = st.checkbox(
-        "启用 HYDE",
+        "✨ HYDE（假设性文档扩展）",
         value=True,
-        help="假设性文档扩展，生成假设性答案辅助检索"
+        help="生成假设性答案辅助检索，提高语义匹配度"
     )
     
     use_multi_query = st.checkbox(
-        "启用 Multi-Query",
+        "🔄 Multi-Query（多查询扩展）",
         value=True,
-        help="多查询扩展，生成多个相关查询提高召回率"
+        help="生成多个相关查询并行检索，提高召回率"
     )
     
+    st.markdown("---")
+    st.markdown("### 🎯 LLM重排序")
+    
     llm_reranking = st.checkbox(
-        "启用 LLM 重排序",
+        "🧠 启用 LLM 重排序",
         value=True,
-        help="使用LLM对检索结果重新排序，提高相关性"
+        help="使用LLM智能评估相关性并重新排序，显著提高精确度"
     )
     
     if llm_reranking:
-        st.info("🎯 启用重排序时，初始检索50个chunks，最终返回前N个")
+        rerank_sample_size = st.slider(
+            "🔍 初始召回数量",
+            min_value=20,
+            max_value=100,
+            value=50,
+            step=10,
+            help="LLM重排序前先召回的候选chunks数量（更多=更全面但更慢）"
+        )
+        st.success(f"✅ **推荐配置**\n\n🎯 检索流程：召回 **{rerank_sample_size}** 个候选 → LLM重排序 → 返回前 **{top_n_retrieval}** 个")
+        
+        # 上游扩充配置
+        st.markdown("---")
+        st.markdown("### 🔄 上游扩充（推荐）")
+        
+        expand_upstream = st.checkbox(
+            "📈 启用上游扩充",
+            value=True,
+            help="✨ 推荐开启！在答案生成前扩充页面组合，让LLM基于更完整的上下文生成高质量答案"
+        )
+        
+        if expand_upstream:
+            col1, col2 = st.columns(2)
+            with col1:
+                expand_top_k = st.slider(
+                    "核心页面数",
+                    min_value=3,
+                    max_value=10,
+                    value=5,
+                    help="选取重排序后的前K个页面作为核心"
+                )
+            with col2:
+                expand_context_size = st.slider(
+                    "上下扩充页数",
+                    min_value=1,
+                    max_value=3,
+                    value=2,
+                    help="每个核心页面上下各扩充N页"
+                )
+            
+            estimated_pages = expand_top_k * (2 * expand_context_size + 1)
+            st.info(f"📊 **扩充预览**\n\n{expand_top_k} 个核心页 × {2*expand_context_size+1} 页/组 ≈ **{estimated_pages}** 页 → 去重后约 **20-40** 页")
+            
+            # Token估算和警告
+            estimated_tokens = estimated_pages * 800  # 假设每页平均800 tokens
+            if estimated_tokens > 25000:
+                st.error(f"🚨 **Token超限警告**\n\n预计 **{estimated_tokens:,}** tokens，可能超过API限制！\n\n💡 **建议**：expand_top_k ≤ 5 或 expand_context_size = 1")
+            elif estimated_tokens > 15000:
+                st.warning(f"⚠️ **Token消耗较高**\n\n预计 **{estimated_tokens:,}** tokens，响应时间可能较长")
+            else:
+                st.success(f"✅ **Token消耗适中**\n\n预计 **{estimated_tokens:,}** tokens")
+        else:
+            expand_top_k = 5
+            expand_context_size = 2
+            st.info("💡 **下游扩充模式**\n\nLLM生成答案后扩充，仅用于展示参考资料（不影响答案质量）")
+    else:
+        rerank_sample_size = 10  # 不启用时默认值
+        expand_upstream = False
+        expand_top_k = 5
+        expand_context_size = 2
     
     # 多轮对话设置
     st.markdown("---")
@@ -439,8 +791,8 @@ with st.sidebar:
     
     enable_multi_turn = st.checkbox(
         "启用多轮对话",
-        value=st.session_state.enable_multi_turn,
-        help="启用后，系统会记住历史对话，理解上下文和指代关系",
+        value=False,
+        help="启用后，系统会记住历史对话，理解上下文和指代关系（可能增加token消耗）",
         key="multi_turn_checkbox"
     )
     st.session_state.enable_multi_turn = enable_multi_turn
@@ -461,15 +813,28 @@ with st.sidebar:
     else:
         st.warning("⚠️ 多轮对话已关闭，每次问答相互独立")
     
-    # 更新配置
-    st.session_state.config = {
+    # 检测配置变化
+    new_config = {
         'api_provider': api_provider,
         'answering_model': answering_model,
         'top_n_retrieval': top_n_retrieval,
         'use_hyde': use_hyde,
         'use_multi_query': use_multi_query,
-        'llm_reranking': llm_reranking
+        'llm_reranking': llm_reranking,
+        'rerank_sample_size': rerank_sample_size,
+        'expand_upstream': expand_upstream,
+        'expand_top_k': expand_top_k,
+        'expand_context_size': expand_context_size
     }
+    
+    # 如果配置改变且系统已初始化，需要重新初始化
+    if st.session_state.initialized and st.session_state.config != new_config:
+        st.session_state.initialized = False
+        st.session_state.processor = None
+        st.warning("⚠️ 检测到配置变化，系统将在下次查询时重新初始化")
+    
+    # 更新配置
+    st.session_state.config = new_config
     
     st.markdown("---")
     st.subheader("📊 系统状态")
@@ -630,7 +995,30 @@ if st.button("🚀 获取答案", type="primary", use_container_width=True):
             st.success("✅ 问答完成！")
             
         except Exception as e:
-            st.error(f"❌ 处理问题时出错: {str(e)}")
+            error_msg = str(e)
+            
+            # 特殊处理400错误（通常是Token超限）
+            if "400" in error_msg or "Bad Request" in error_msg:
+                st.error("❌ **API请求失败：400 Bad Request**")
+                st.markdown("""
+                **可能原因**：
+                - 🚨 **Token超限**：上游扩充导致上下文过长（46页约36,800 tokens）
+                - ⚠️ API参数错误或格式不正确
+                
+                **解决方法**：
+                1. **降低 expand_top_k**：从 10 降至 3-5
+                2. **降低 expand_context_size**：从 2 降至 1
+                3. **关闭上游扩充**：使用传统的下游扩充模式
+                4. 检查侧边栏的Token预估，确保不超过 25,000 tokens
+                
+                **推荐配置**（适合大部分场景）：
+                - expand_top_k = 5
+                - expand_context_size = 2
+                - 预计Token: ~20,000 ✅
+                """)
+            else:
+                st.error(f"❌ 处理问题时出错: {error_msg}")
+            
             with st.expander("查看详细错误"):
                 st.code(traceback.format_exc())
 

@@ -152,8 +152,12 @@ class BaseQwenProcessor:
             response = requests.post(self.base_url, headers=headers, json=payload, timeout=60)
             print(f"[DEBUG] [Qwen API] Status: {response.status_code}, Response length: {len(response.text)} bytes")
             sys.stdout.flush()
-            # Uncomment below to see full response (verbose):
-            # print(f"[DEBUG] [Qwen API] Full response: {response.text}")
+            
+            # 如果状态码不是200，打印错误详情
+            if response.status_code != 200:
+                print(f"[ERROR] [Qwen API] Full error response: {response.text}")
+                sys.stdout.flush()
+            
             response.raise_for_status()
             result = response.json()
             # 保存最近一次API响应内容
