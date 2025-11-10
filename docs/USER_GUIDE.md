@@ -15,10 +15,11 @@
 
 ### 前提条件
 
-确保已完成数据准备：
-- ✅ PDF 文件已解析
-- ✅ 向量数据库已创建
-- ✅ 数据目录存在: `data/val_set/databases/`
+确保已完成环境安装：
+- ✅ Python 3.10+ 已安装
+- ✅ 依赖已安装（运行过 `./scripts/setup/install_streamlit.sh`）
+- ✅ API密钥已配置（`.env` 文件）
+- ✅ 数据已准备（可选，项目已包含测试数据）
 
 ### 启动方式
 
@@ -27,21 +28,17 @@
 ./scripts/start_frontend.sh
 ```
 
-**方法 2: 直接运行**
+**方法 2: 手动启动**
 ```bash
-streamlit run app_jinpan_qa.py
-```
-
-**方法 3: Python 模块方式**
-```bash
-python3 -m streamlit run app_jinpan_qa.py
+source venv_streamlit/bin/activate  # 激活虚拟环境
+streamlit run app_jinpan_qa.py --server.port 8501
 ```
 
 ### 访问地址
 
 启动后在浏览器访问：
-- **本机访问**: http://localhost:8502
-- **局域网访问**: http://[你的IP]:8502
+- **本机访问**: http://localhost:8501
+- **局域网访问**: http://[你的局域网IP]:8501
 
 ---
 
@@ -342,11 +339,22 @@ sudo firewall-cmd --reload
 
 ### Q10: API Key 在哪里配置？
 
-**A**: API Key 已预配置在 `app_jinpan_qa.py` 中：
-- DASHSCOPE_API_KEY (Qwen)
-- GOOGLE_API_KEY (Gemini)
+**A**: 使用 `.env` 文件配置（推荐）：
+```bash
+# 1. 复制示例文件
+cp .env.example .env
 
-如需修改，编辑文件第16-17行。
+# 2. 编辑并填入你的 API keys
+nano .env
+```
+
+或者在代码中配置（不推荐，容易泄露）。
+
+### Q11: 如何获取 API密钥？
+
+**A**: 
+- **Qwen (通义千问)**: https://dashscope.console.aliyun.com/
+- **OpenAI**: https://platform.openai.com/api-keys
 
 ---
 
