@@ -14,13 +14,18 @@ data/test_set/pdf_reports/
 data/test_set/*.zip
 
 # ==================== 部署脚本（包含敏感信息）====================
-# 不上传部署配置和脚本
+# 不上传远程部署脚本和配置（包含服务器信息）
 deploy.sh
 deploy_config.sh
 start_server.sh
 DEPLOYMENT.md
 DEPLOYMENT_QUICK.md
-scripts/
+scripts/deployment/
+scripts/deploy/
+
+# 保留本地部署脚本（不含敏感信息）
+!scripts/setup/
+!scripts/start_frontend.sh
 
 # ==================== 文档管理 ====================
 # 忽略历史文档和临时文档
