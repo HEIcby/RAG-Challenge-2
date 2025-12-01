@@ -12,6 +12,7 @@ import json
 from datetime import datetime
 import traceback
 import pandas as pd
+from typing import List
 try:
     import fitz  # PyMuPDF
 except ImportError:
@@ -28,6 +29,65 @@ root_dir = Path(__file__).parent
 sys.path.insert(0, str(root_dir))
 
 from src.questions_processing import QuestionsProcessor
+from src.api_requests import APIProcessor
+
+# 加载 benchmark 标准答案映射
+@st.cache_data
+def load_benchmark_answers(benchmark_path: str) -> dict:
+    """
+    加载 benchmark CSV，建立 问题 -> 标准答案 的映射
+    """
+    import csv
+    import re
+    mapping = {}
+    try:
+        with open(benchmark_path, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                question = row.get('问题', '').strip()
+                answer = row.get('标准回答', '').strip()
+                if question and answer:
+                    # 清理问题文本用于匹配
+                    question_clean = re.sub(r'\s+', ' ', question)
+                    mapping[question_clean] = answer
+    except Exception as e:
+        st.warning(f"加载 benchmark 失败: {e}")
+    return mapping
+
+# 从 questions.csv 或 benchmark 中获取标准答案
+@st.cache_data
+def get_standard_answer(question: str, questions_df: pd.DataFrame = None, benchmark_map: dict = None) -> str:
+    """
+    获取问题的标准答案
+    优先从 questions.csv 的"标准回答"列获取，如果没有则从 benchmark 中匹配
+    """
+    import re
+    
+    # 清理问题文本
+    question_clean = re.sub(r'\s+', ' ', question.strip())
+    
+    # 1. 先从 questions.csv 中查找
+    if questions_df is not None:
+        for idx, row in questions_df.iterrows():
+            if question_clean == re.sub(r'\s+', ' ', str(row.get('提问内容', '')).strip()):
+                standard_answer = row.get('标准回答', '')
+                if standard_answer and str(standard_answer).strip():
+                    return str(standard_answer).strip()
+    
+    # 2. 从 benchmark 中匹配
+    if benchmark_map:
+        # 精确匹配
+        if question_clean in benchmark_map:
+            return benchmark_map[question_clean]
+        
+        # 模糊匹配（去除标点符号）
+        question_normalized = re.sub(r'[^\w]', '', question_clean)
+        for bq, answer in benchmark_map.items():
+            bq_normalized = re.sub(r'[^\w]', '', bq)
+            if question_normalized == bq_normalized:
+                return answer
+    
+    return ""
 
 # 加载 subset.csv 映射（SHA1 -> 文档信息）
 @st.cache_data
@@ -53,6 +113,36 @@ def load_document_mapping(subset_path: str) -> dict:
     except Exception as e:
         st.error(f"加载 subset.csv 失败: {e}")
     return mapping
+
+# 获取可用年份列表
+@st.cache_data
+def get_available_years(subset_path: str, company_name: str) -> List[int]:
+    """
+    从 subset.csv 获取指定公司的所有可用年份
+    
+    Args:
+        subset_path: subset.csv 文件路径
+        company_name: 公司名称
+    
+    Returns:
+        排序后的年份列表
+    """
+    import csv
+    years = set()
+    try:
+        with open(subset_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get('company_name', '') == company_name:
+                    year_str = row.get('year', '').strip()
+                    if year_str:
+                        try:
+                            years.add(int(year_str))
+                        except ValueError:
+                            pass
+    except Exception as e:
+        st.warning(f"获取可用年份失败: {e}")
+    return sorted(list(years))
 
 # 页面配置
 st.set_page_config(
@@ -151,9 +241,11 @@ if 'example_clicked' not in st.session_state:
 if 'widget_key_counter' not in st.session_state:
     st.session_state.widget_key_counter = 0
 if 'enable_multi_turn' not in st.session_state:
-    st.session_state.enable_multi_turn = True  # 默认启用多轮对话
+    st.session_state.enable_multi_turn = False  # 默认关闭多轮对话
 if 'context_turns' not in st.session_state:
     st.session_state.context_turns = 3  # 默认保留3轮历史
+if 'flow_step_selector' not in st.session_state:
+    st.session_state.flow_step_selector = 'overview'
 
 def initialize_system():
     """初始化RAG问答系统"""
@@ -180,19 +272,20 @@ def initialize_system():
                 questions_file_path=None,
                 new_challenge_pipeline=True,
                 subset_path=subset_path,
-                parent_document_retrieval=False,
+                parent_document_retrieval=True,
                 llm_reranking=config['llm_reranking'],
                 llm_reranking_sample_size=config.get('rerank_sample_size', 50),
                 top_n_retrieval=config['top_n_retrieval'],
-                parallel_requests=1,
+                parallel_requests=config.get('parallel_requests', 4),
                 api_provider=config['api_provider'],
                 answering_model=config['answering_model'],
                 full_context=False,
                 use_hyde=config['use_hyde'],
                 use_multi_query=config['use_multi_query'],
+                multi_query_methods=config.get('multi_query_methods'),
                 expand_upstream=config.get('expand_upstream', False),
                 expand_top_k=config.get('expand_top_k', 5),
-                expand_context_size=config.get('expand_context_size', 2)
+                expand_context_size=config.get('expand_context_size', 1)
             )
             
             st.session_state.processor = processor
@@ -252,18 +345,120 @@ def get_pdf_page_image(pdf_path: str, page_num: int, dpi: int = 150):
         st.warning(f"⚠️ 无法提取PDF页面图片: {str(e)}")
         return None
 
-def format_answer_display(answer_dict: dict):
+def format_answer_display(answer_dict: dict, question: str = ""):
     """格式化并显示答案"""
     # 获取答案
     answer = answer_dict.get("final_answer", answer_dict.get("answer", "N/A"))
     
+    # 获取标准答案
+    standard_answer = ""
+    if question:
+        try:
+            questions_df = pd.read_csv("data/val_set/questions.csv")
+            benchmark_map = load_benchmark_answers("金盘财报查询场景问题benchmark-工作表1.csv")
+            standard_answer = get_standard_answer(question, questions_df, benchmark_map)
+        except Exception as e:
+            st.warning(f"获取标准答案失败: {e}")
+    
+    # 获取计时信息
+    timing = answer_dict.get("timing", {})
+    
     # 主答案 - 使用更明显的对比色
     st.markdown("### 📊 答案")
-    st.markdown(f'<div class="answer-box"><h2 style="color: #0d6efd; margin-top: 0; margin-bottom: 0;">💡 {answer}</h2></div>', 
-                unsafe_allow_html=True)
+    
+    # 并排显示RAG答案和标准答案
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("**🤖 RAG生成的答案**")
+        st.markdown(f'<div class="answer-box"><h3 style="color: #0d6efd; margin-top: 0; margin-bottom: 0;">💡 {answer}</h3></div>', 
+                    unsafe_allow_html=True)
+    
+    with col2:
+        st.markdown("**✅ 标准答案**")
+        if standard_answer:
+            st.markdown(f'<div class="answer-box" style="background-color: #d1e7dd;"><h3 style="color: #0a3622; margin-top: 0; margin-bottom: 0;">📋 {standard_answer}</h3></div>', 
+                        unsafe_allow_html=True)
+        else:
+            st.info("暂无标准答案")
+    
+    # 显示计时信息（简洁的指标卡片）
+    if timing:
+        st.markdown("---")
+        st.markdown("### ⏱️ 性能指标")
+        
+        # 计算关键阶段的用时
+        total_time = timing.get("total_time", 0.0)
+        retrieval_time = timing.get("retrieval", 0.0)  # 总检索时间（包含HYDE、Multi-Query、向量搜索）
+        hyde_time = timing.get("hyde_expansion", 0.0)
+        multi_query_time = timing.get("multi_query_expansion", 0.0)
+        vector_search_time = timing.get("vector_search", 0.0)
+        llm_reranking_time = timing.get("llm_reranking", 0.0)
+        generate_answer_time = timing.get("generate_answer", 0.0)
+        
+        # 向量检索总时间：如果vector_search单独统计，则相加；否则使用retrieval_time
+        if vector_search_time > 0:
+            vector_retrieval_total = hyde_time + multi_query_time + vector_search_time
+        else:
+            # vector_search未单独统计，使用总检索时间
+            vector_retrieval_total = retrieval_time
+        
+        # 使用4列布局展示关键指标
+        metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+        
+        with metric_col1:
+            st.metric("总用时", f"{total_time:.2f}s" if total_time > 0 else "N/A")
+        
+        with metric_col2:
+            st.metric("向量检索", f"{vector_retrieval_total:.2f}s" if vector_retrieval_total > 0 else "N/A")
+        
+        with metric_col3:
+            if llm_reranking_time > 0:
+                st.metric("LLM重排序", f"{llm_reranking_time:.2f}s")
+            else:
+                st.metric("LLM重排序", "未使用")
+        
+        with metric_col4:
+            st.metric("生成答案", f"{generate_answer_time:.2f}s" if generate_answer_time > 0 else "N/A")
+        
+        reranker_stats = answer_dict.get("reranker_stats") or timing.get("reranker_stats")
+        if reranker_stats:
+            st.markdown("#### 🤖 LLM重排序统计")
+            stat_cols = st.columns(3)
+            success_rate = reranker_stats.get("success_rate", 0.0) * 100
+            stat_cols[0].metric("成功率", f"{success_rate:.1f}%")
+            stat_cols[1].metric("请求总数", reranker_stats.get("total_requests", 0))
+            stat_cols[2].metric(
+                "平均LLM耗时",
+                f"{reranker_stats.get('avg_llm_latency', 0.0):.2f}s"
+            )
+            st.caption(
+                f"并发上限: {reranker_stats.get('max_concurrent_requests', 'N/A')} | "
+                f"QPS限制: {reranker_stats.get('request_rate_limit', 'N/A')} | "
+                f"批次回退: {reranker_stats.get('batch_fallbacks', 0)} | "
+                f"缺失排名补偿: {reranker_stats.get('missing_rankings', 0)}"
+            )
+            if reranker_stats.get("last_error"):
+                st.info(f"最近错误：{reranker_stats['last_error']}")
+
+        # 可选：使用expander展示更详细的各阶段用时（用于调试）
+        with st.expander("📊 查看详细计时信息"):
+            timing_df = pd.DataFrame([
+                {'阶段': '初始化检索器', '用时(秒)': timing.get('init_retriever', 0.0)},
+                {'阶段': 'HYDE扩展', '用时(秒)': timing.get('hyde_expansion', 0.0)},
+                {'阶段': 'Multi-Query扩展', '用时(秒)': timing.get('multi_query_expansion', 0.0)},
+                {'阶段': '向量搜索', '用时(秒)': timing.get('vector_search', 0.0)},
+                {'阶段': '向量检索总时间', '用时(秒)': timing.get('retrieval', 0.0)},
+                {'阶段': 'LLM重排序', '用时(秒)': timing.get('llm_reranking', 0.0)},
+                {'阶段': '上游扩充', '用时(秒)': timing.get('upstream_expansion', 0.0)},
+                {'阶段': '格式化结果', '用时(秒)': timing.get('format_results', 0.0)},
+                {'阶段': '生成答案', '用时(秒)': timing.get('generate_answer', 0.0)},
+                {'阶段': '总用时', '用时(秒)': timing.get('total_time', 0.0)},
+            ])
+            st.dataframe(timing_df, use_container_width=True, hide_index=True)
     
     # 创建标签页
-    tab1, tab2, tab3, tab4 = st.tabs(["🔍 分析过程", "📝 推理总结", "📚 LLM选用的参考", "🗂️ 所有检索结果"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔍 分析过程", "📝 推理总结", "📚 LLM选用的参考", "🗂️ 所有检索结果", "💬 生成提示词"])
     
     with tab1:
         if "step_by_step_analysis" in answer_dict:
@@ -575,6 +770,197 @@ def format_answer_display(answer_dict: dict):
                     )
         else:
             st.info("无检索结果信息")
+    
+    with tab5:
+        # 显示生成阶段的提示词信息
+        if "prompt_info" in answer_dict:
+            prompt_info = answer_dict["prompt_info"]
+            
+            st.markdown("### 💬 LLM生成阶段的提示词")
+            st.caption(f"📋 Schema: {prompt_info.get('schema', 'N/A')} | 🤖 Model: {prompt_info.get('model', 'N/A')}")
+            
+            # 页面选择信息（两阶段流程）
+            if "page_selection" in prompt_info:
+                page_selection = prompt_info["page_selection"]
+                st.markdown("---")
+                st.markdown("#### 🎯 页面选择阶段（两阶段流程的第一步）")
+                selected_pages = page_selection.get('selected_pages', [])
+                selection_reasoning = page_selection.get('selection_reasoning', '')
+                all_retrieval_context = page_selection.get('all_retrieval_context', '')
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    # 计算所有检索结果的数量（通过分割 "---" 来估算）
+                    total_retrieval_count = len(all_retrieval_context.split('---')) if all_retrieval_context else 0
+                    st.metric("📊 总检索数量", total_retrieval_count if total_retrieval_count > 0 else "N/A")
+                with col2:
+                    st.metric("✅ 选定页面数", len(selected_pages))
+                
+                if selected_pages:
+                    st.markdown(f"**选定的页面：** {', '.join(map(str, selected_pages))}")
+                
+                if selection_reasoning:
+                    st.markdown("**选择理由：**")
+                    st.info(selection_reasoning)
+                
+                # 显示所有检索结果的上下文（用于对比）
+                if all_retrieval_context:
+                    with st.expander("📋 查看所有检索结果的上下文（页面选择阶段使用）", expanded=False):
+                        st.caption(f"这是页面选择阶段看到的所有检索结果（共 {len(all_retrieval_context.split('---'))} 个结果）")
+                        st.text_area(
+                            "All Retrieval Context",
+                            all_retrieval_context,
+                            height=400,
+                            key="all_retrieval_context_display",
+                            label_visibility="collapsed"
+                        )
+            
+            st.markdown("---")
+            
+            # System Prompt
+            st.markdown("#### 📘 System Prompt（系统提示词）")
+            st.text_area(
+                "System Prompt",
+                prompt_info.get('system_prompt', ''),
+                height=300,
+                key="system_prompt_display",
+                label_visibility="collapsed"
+            )
+            
+            st.markdown("---")
+            
+            # User Prompt
+            st.markdown("#### 📝 User Prompt（用户提示词）")
+            st.caption("包含完整的上下文信息和问题")
+            st.text_area(
+                "User Prompt",
+                prompt_info.get('user_prompt', ''),
+                height=400,
+                key="user_prompt_display",
+                label_visibility="collapsed"
+            )
+            
+            st.markdown("---")
+            
+            # RAG Context（仅上下文部分）
+            st.markdown("#### 📚 RAG Context（检索到的上下文）")
+            if "page_selection" in prompt_info:
+                st.caption("这是传递给LLM的上下文信息，仅包含页面选择阶段选定的页面文本（两阶段流程）")
+            else:
+                st.caption("这是传递给LLM的上下文信息，包含所有检索到的页面文本")
+            rag_context = prompt_info.get('rag_context', '')
+            if rag_context:
+                # 计算上下文长度
+                context_length = len(rag_context)
+                st.caption(f"上下文长度: {context_length:,} 字符")
+                st.text_area(
+                    "RAG Context",
+                    rag_context,
+                    height=500,
+                    key="rag_context_display",
+                    label_visibility="collapsed"
+                )
+            else:
+                st.info("无上下文信息")
+            
+            st.markdown("---")
+            
+            # Question
+            st.markdown("#### ❓ Question（问题）")
+            st.caption("发送给LLM的完整问题（可能包含对话历史）")
+            question = prompt_info.get('question', '')
+            st.text_area(
+                "Question",
+                question,
+                height=150,
+                key="question_display",
+                label_visibility="collapsed"
+            )
+            
+            # 展示扩展文本（HYDE和Multi-Query）
+            if "expansion_texts" in answer_dict:
+                expansion_texts = answer_dict.get("expansion_texts", {})
+                
+                st.markdown("---")
+                st.markdown("### 🔄 查询扩展生成的文本")
+                
+                # HYDE扩展文本
+                if expansion_texts.get('hyde_text'):
+                    st.markdown("#### 🔮 HYDE 扩展（假设答案）")
+                    st.caption("HYDE方法生成的假设答案文本，用于增强检索")
+                    st.text_area(
+                        "HYDE Text",
+                        expansion_texts['hyde_text'],
+                        height=200,
+                        key="hyde_text_display",
+                        label_visibility="collapsed"
+                    )
+                else:
+                    st.markdown("#### 🔮 HYDE 扩展")
+                    st.info("未启用HYDE扩展")
+                
+                st.markdown("---")
+                
+                # Multi-Query扩展文本
+                multi_query_texts = expansion_texts.get('multi_query_texts', [])
+                mq_methods_used = expansion_texts.get('multi_query_methods', {})
+                
+                st.markdown("#### 🔄 Multi-Query 扩展（扩展查询）")
+                
+                # 检查是否启用了 Multi-Query
+                if not any(mq_methods_used.values()):
+                    st.info("⚪ 未启用 Multi-Query 扩展")
+                elif multi_query_texts:
+                    st.caption(f"Multi-Query方法生成的扩展查询，共 {len(multi_query_texts)} 个")
+                    
+                    for idx, mq_item in enumerate(multi_query_texts, 1):
+                        method_id = mq_item.get('method_id', idx)
+                        query_text = mq_item.get('query', '')
+                        
+                        method_names = {
+                            1: "名词解释",
+                            2: "指标拆分",
+                            3: "情景变体"
+                        }
+                        method_name = method_names.get(method_id, f"方法{method_id}")
+                        
+                        with st.expander(f"📝 {method_name} (方法 {method_id})", expanded=(idx == 1)):
+                            st.text_area(
+                                f"扩展查询 {idx}",
+                                query_text,
+                                height=100,
+                                key=f"multi_query_{method_id}_{idx}",
+                                label_visibility="collapsed"
+                            )
+                else:
+                    # Multi-Query 已启用但没有生成扩展查询（LLM 判断问题已足够清晰）
+                    st.info("✅ Multi-Query 已启用，但 LLM 判断当前问题已足够清晰，无需扩展查询")
+
+                # 显示启用的 Multi-Query 方法
+                if any(mq_methods_used.values()):
+                    label_map = {
+                        'synonym': "名词解释",
+                        'subquestion': "指标拆分",
+                        'variant': "情景变体"
+                    }
+                    enabled_labels = [label_map[k] for k, v in mq_methods_used.items() if v]
+                    if enabled_labels:
+                        st.caption("本次启用的扩展方式：" + "、".join(enabled_labels))
+                
+                # 显示名词解释（Glossary）
+                glossary_context = expansion_texts.get('glossary_context')
+                if glossary_context:
+                    st.markdown("---")
+                    st.markdown("##### 📖 Multi-Query 使用的财务名词解释")
+                    st.text_area(
+                        "Glossary Context",
+                        glossary_context,
+                        height=220,
+                        key="multi_query_glossary_display",
+                        label_visibility="collapsed"
+                    )
+        else:
+            st.info("⚠️ 提示词信息不可用（可能是旧版本的答案）")
 
 def save_history():
     """保存问答历史"""
@@ -629,8 +1015,87 @@ def prepare_conversation_history(max_turns: int) -> list:
 with st.sidebar:
     st.title("⚙️ 系统配置")
     
-    # 显示推荐配置提示
-    with st.expander("✨ 当前配置 - 推荐配置", expanded=False):
+    if 'config' not in st.session_state:
+        st.session_state.config = {
+            'api_provider': 'qwen',
+            'answering_model': 'qwen-max',
+            'top_n_retrieval': 10,
+            'use_hyde': True,
+            'use_multi_query': True,
+            'llm_reranking': True,
+            'rerank_sample_size': 50,
+            'expand_upstream': True,
+            'expand_top_k': 5,
+            'expand_context_size': 1,
+            'parallel_requests': 4,
+            'multi_query_methods': {
+                'synonym': True,
+                'subquestion': False,
+                'variant': False
+            }
+        }
+    
+    flow_steps = [
+        {"id": "overview", "label": "流程概览", "icon": "🏁"},
+        {"id": "model", "label": "模型配置", "icon": "🤖"},
+        {"id": "retrieval", "label": "基础检索", "icon": "⚙️"},
+        {"id": "enhancement", "label": "检索增强", "icon": "🚀"},
+        {"id": "rerank", "label": "LLM重排序", "icon": "🎯"},
+        {"id": "expansion", "label": "上游扩充", "icon": "🔄"},
+        {"id": "data", "label": "数据与多轮", "icon": "📅"},
+    ]
+    flow_options = [step["id"] for step in flow_steps]
+    current_step = st.session_state.get("flow_step_selector", flow_options[0])
+    selected_step = st.radio(
+        "流程节点",
+        options=flow_options,
+        index=flow_options.index(current_step),
+        format_func=lambda x: next(step["label"] for step in flow_steps if step["id"] == x),
+        key="flow_step_selector",
+        label_visibility="collapsed"
+    )
+    
+    st.markdown("""
+    <style>
+    .flow-container {display:flex;flex-direction:column;gap:6px;margin-bottom:12px;}
+    .flow-step {border:1px solid #e1e6ef;border-radius:10px;padding:6px 12px;background:#f8f9fc;color:#495057;font-weight:500;display:flex;align-items:center;gap:8px;}
+    .flow-step.active {background:linear-gradient(90deg,#0d6efd,#6ea8fe);color:#fff;border-color:#0d6efd;box-shadow:0 4px 10px rgba(13,110,253,0.2);}
+    .flow-arrow {text-align:center;color:#adb5bd;}
+    </style>
+    """, unsafe_allow_html=True)
+    
+    flow_html = "<div class='flow-container'>"
+    for idx, step in enumerate(flow_steps):
+        active_class = "active" if step["id"] == selected_step else ""
+        flow_html += f"<div class='flow-step {active_class}'>{step['icon']} {step['label']}</div>"
+        if idx < len(flow_steps) - 1:
+            flow_html += "<div class='flow-arrow'>↓</div>"
+    flow_html += "</div>"
+    st.markdown(flow_html, unsafe_allow_html=True)
+    
+    config_defaults = st.session_state.config
+    if 'multi_query_methods' not in config_defaults:
+        config_defaults['multi_query_methods'] = {
+            'synonym': True,
+            'subquestion': False,
+            'variant': False
+        }
+    multi_query_methods_defaults = config_defaults['multi_query_methods']
+    selected_multi_query_methods = multi_query_methods_defaults.copy()
+    api_provider = config_defaults.get('api_provider', 'qwen')
+    answering_model = config_defaults.get('answering_model', 'qwen-max')
+    top_n_retrieval = config_defaults.get('top_n_retrieval', 10)
+    use_hyde = config_defaults.get('use_hyde', True)
+    use_multi_query = config_defaults.get('use_multi_query', True)
+    llm_reranking = config_defaults.get('llm_reranking', True)
+    rerank_sample_size = config_defaults.get('rerank_sample_size', 50)
+    expand_upstream = config_defaults.get('expand_upstream', True)
+    expand_top_k = config_defaults.get('expand_top_k', 5)
+    expand_context_size = config_defaults.get('expand_context_size', 1)
+    selected_years = st.session_state.get("selected_years", []) or []
+    parallel_requests = config_defaults.get('parallel_requests', 4)
+    
+    with st.expander("✨ 流程概览 · 推荐配置", expanded=(selected_step == "overview")):
         st.markdown("""
         **🎯 推荐设置（已应用）**
         
@@ -641,177 +1106,201 @@ with st.sidebar:
         ✅ 初始召回：50  
         ✅ 上游扩充：开启  
         ✅ 核心页面：5  
-        ✅ 扩充页数：上下各2页  
+        ✅ 扩充页数：上下各1页  
         ✅ 多轮对话：关闭  
         
-        💡 这些配置在大多数场景下效果最佳
+        💡 使用上方流程图可快速跳转至对应步骤进行配置
         """)
     
-    # 初始化默认配置
-    if 'config' not in st.session_state:
-        st.session_state.config = {
-            'api_provider': 'qwen',
-            'answering_model': 'qwen-max',
-            'top_n_retrieval': 10,
-            'use_hyde': True,  # ✅ 已改用 Qwen API
-            'use_multi_query': True,  # ✅ 已改用 Qwen API
-            'llm_reranking': True,
-            'rerank_sample_size': 50
-        }
-    
-    st.markdown("---")
-    st.subheader("🤖 模型配置")
-    
-    api_provider = st.selectbox(
-        "API 提供商",
-        options=['qwen', 'openai', 'gemini'],
-        index=0,
-        help="选择大语言模型API提供商"
-    )
-    
-    # 根据API提供商显示不同的模型选项
-    if api_provider == 'qwen':
-        model_options = ['qwen-max', 'qwen-plus', 'qwen-turbo']
-        default_model = 'qwen-max'
-    elif api_provider == 'openai':
-        model_options = ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo']
-        default_model = 'gpt-4o-mini'
-    else:  # gemini
-        model_options = ['gemini-1.5-pro', 'gemini-1.5-flash']
-        default_model = 'gemini-1.5-pro'
-    
-    answering_model = st.selectbox(
-        "回答模型",
-        options=model_options,
-        index=0,
-        help="用于生成答案的模型"
-    )
-    
-    st.markdown("---")
-    
-    st.markdown("### ⚙️ 基础检索")
-    
-    top_n_retrieval = st.slider(
-        "📊 最终检索数量",
-        min_value=5,
-        max_value=30,
-        value=10,
-        step=5,
-        help="经过重排序后最终返回给LLM的文档块数量"
-    )
-    
-    st.markdown("---")
-    st.markdown("### 🚀 检索增强")
-    
-    use_hyde = st.checkbox(
-        "✨ HYDE（假设性文档扩展）",
-        value=True,
-        help="生成假设性答案辅助检索，提高语义匹配度"
-    )
-    
-    use_multi_query = st.checkbox(
-        "🔄 Multi-Query（多查询扩展）",
-        value=True,
-        help="生成多个相关查询并行检索，提高召回率"
-    )
-    
-    st.markdown("---")
-    st.markdown("### 🎯 LLM重排序")
-    
-    llm_reranking = st.checkbox(
-        "🧠 启用 LLM 重排序",
-        value=True,
-        help="使用LLM智能评估相关性并重新排序，显著提高精确度"
-    )
-    
-    if llm_reranking:
-        rerank_sample_size = st.slider(
-            "🔍 初始召回数量",
-            min_value=20,
-            max_value=100,
-            value=50,
-            step=10,
-            help="LLM重排序前先召回的候选chunks数量（更多=更全面但更慢）"
-        )
-        st.success(f"✅ **推荐配置**\n\n🎯 检索流程：召回 **{rerank_sample_size}** 个候选 → LLM重排序 → 返回前 **{top_n_retrieval}** 个")
-        
-        # 上游扩充配置
-        st.markdown("---")
-        st.markdown("### 🔄 上游扩充（推荐）")
-        
-        expand_upstream = st.checkbox(
-            "📈 启用上游扩充",
-            value=True,
-            help="✨ 推荐开启！在答案生成前扩充页面组合，让LLM基于更完整的上下文生成高质量答案"
+    with st.expander("🤖 模型配置", expanded=(selected_step == "model")):
+        api_provider = st.selectbox(
+            "API 提供商",
+            options=['qwen', 'openai', 'gemini'],
+            index=['qwen', 'openai', 'gemini'].index(api_provider) if api_provider in ['qwen', 'openai', 'gemini'] else 0,
+            help="选择大语言模型API提供商"
         )
         
-        if expand_upstream:
-            col1, col2 = st.columns(2)
-            with col1:
-                expand_top_k = st.slider(
-                    "核心页面数",
-                    min_value=3,
-                    max_value=10,
-                    value=5,
-                    help="选取重排序后的前K个页面作为核心"
-                )
-            with col2:
-                expand_context_size = st.slider(
-                    "上下扩充页数",
-                    min_value=1,
-                    max_value=3,
-                    value=2,
-                    help="每个核心页面上下各扩充N页"
-                )
-            
-            estimated_pages = expand_top_k * (2 * expand_context_size + 1)
-            st.info(f"📊 **扩充预览**\n\n{expand_top_k} 个核心页 × {2*expand_context_size+1} 页/组 ≈ **{estimated_pages}** 页 → 去重后约 **20-40** 页")
-            
-            # Token估算和警告
-            estimated_tokens = estimated_pages * 800  # 假设每页平均800 tokens
-            if estimated_tokens > 25000:
-                st.error(f"🚨 **Token超限警告**\n\n预计 **{estimated_tokens:,}** tokens，可能超过API限制！\n\n💡 **建议**：expand_top_k ≤ 5 或 expand_context_size = 1")
-            elif estimated_tokens > 15000:
-                st.warning(f"⚠️ **Token消耗较高**\n\n预计 **{estimated_tokens:,}** tokens，响应时间可能较长")
-            else:
-                st.success(f"✅ **Token消耗适中**\n\n预计 **{estimated_tokens:,}** tokens")
+        if api_provider == 'qwen':
+            model_options = ['qwen-max', 'qwen-plus', 'qwen-turbo']
+        elif api_provider == 'openai':
+            model_options = ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo']
         else:
-            expand_top_k = 5
-            expand_context_size = 2
-            st.info("💡 **下游扩充模式**\n\nLLM生成答案后扩充，仅用于展示参考资料（不影响答案质量）")
-    else:
-        rerank_sample_size = 10  # 不启用时默认值
-        expand_upstream = False
-        expand_top_k = 5
-        expand_context_size = 2
-    
-    # 多轮对话设置
-    st.markdown("---")
-    st.markdown("### 💬 多轮对话设置")
-    
-    enable_multi_turn = st.checkbox(
-        "启用多轮对话",
-        value=False,
-        help="启用后，系统会记住历史对话，理解上下文和指代关系（可能增加token消耗）",
-        key="multi_turn_checkbox"
-    )
-    st.session_state.enable_multi_turn = enable_multi_turn
-    
-    if enable_multi_turn:
-        context_turns = st.slider(
-            "保留对话轮数",
-            min_value=1,
-            max_value=10,
-            value=st.session_state.context_turns,
-            step=1,
-            help="设置保留多少轮历史对话作为上下文（轮数越多，token消耗越大）",
-            key="context_turns_slider"
-        )
-        st.session_state.context_turns = context_turns
+            model_options = ['gemini-1.5-pro', 'gemini-1.5-flash']
         
-        st.info(f"💡 当前将保留最近 **{context_turns}** 轮对话作为上下文")
-    else:
-        st.warning("⚠️ 多轮对话已关闭，每次问答相互独立")
+        answering_model = st.selectbox(
+            "回答模型",
+            options=model_options,
+            index=model_options.index(answering_model) if answering_model in model_options else 0,
+            help="用于生成答案的模型"
+        )
+    
+    with st.expander("⚙️ 基础检索", expanded=(selected_step == "retrieval")):
+        top_n_retrieval = st.slider(
+            "📊 最终检索数量",
+            min_value=5,
+            max_value=30,
+            value=top_n_retrieval,
+            step=5,
+            help="经过重排序后最终传递给LLM的文档块数量"
+        )
+    
+    with st.expander("🚀 检索增强", expanded=(selected_step == "enhancement")):
+        use_hyde = st.checkbox(
+            "✨ HYDE（假设性文档扩展）",
+            value=use_hyde,
+            help="生成假设性答案辅助检索，提高语义匹配度",
+            key="hyde_checkbox"
+        )
+        use_multi_query = st.checkbox(
+            "🔄 Multi-Query（多查询扩展）",
+            value=use_multi_query,
+            help="生成多个相关查询并行检索，提高召回率",
+            key="multiquery_checkbox"
+        )
+        if use_multi_query:
+            st.markdown("#### 🧩 Multi-Query 扩展方式")
+            col_syn, col_sub, col_var = st.columns(3)
+            synonym_enabled = col_syn.checkbox(
+                "名词解释",
+                value=multi_query_methods_defaults.get('synonym', True),
+                help="为财务名词补充同义词、定义、计算方式",
+                key=f"multiquery_synonym_checkbox_{selected_step}"
+            )
+            subquestion_enabled = col_sub.checkbox(
+                "指标拆分",
+                value=multi_query_methods_defaults.get('subquestion', False),
+                help="按指标/时间拆分多条子问题",
+                key=f"multiquery_sub_checkbox_{selected_step}"
+            )
+            variant_enabled = col_var.checkbox(
+                "情景变体",
+                value=multi_query_methods_defaults.get('variant', False),
+                help="在问题开放或模糊时生成不同视角的提问",
+                key=f"multiquery_variant_checkbox_{selected_step}"
+            )
+            selected_multi_query_methods = {
+                'synonym': synonym_enabled,
+                'subquestion': subquestion_enabled,
+                'variant': variant_enabled
+            }
+            if not any(selected_multi_query_methods.values()):
+                st.warning("⚠️ 所有扩展方式均已关闭，将仅使用原问题进行检索")
+        else:
+            selected_multi_query_methods = {
+                'synonym': False,
+                'subquestion': False,
+                'variant': False
+            }
+    
+    with st.expander("🎯 LLM 重排序", expanded=(selected_step == "rerank")):
+        llm_reranking = st.checkbox(
+            "🧠 启用 LLM 重排序",
+            value=llm_reranking,
+            help="使用LLM评估相关性并重新排序，显著提高精确度",
+            key="llm_rerank_checkbox"
+        )
+        
+        if llm_reranking:
+            rerank_sample_size = st.slider(
+                "🔍 初始召回数量",
+                min_value=20,
+                max_value=100,
+                value=rerank_sample_size,
+                step=10,
+                help="LLM重排序前先召回的候选chunks数量（越大越全面但越慢）"
+            )
+            st.success(f"✅ 重排序流程：召回 **{rerank_sample_size}** → LLM重排 → 返回 **{top_n_retrieval}**")
+        else:
+            rerank_sample_size = 10
+    
+    with st.expander("🔄 上游扩充", expanded=(selected_step == "expansion")):
+        if llm_reranking:
+            expand_upstream = st.checkbox(
+                "📈 启用上游扩充",
+                value=expand_upstream,
+                help="在答案生成前扩充页面组合，让LLM基于更完整的上下文生成高质量答案",
+                key="upstream_checkbox"
+            )
+            if expand_upstream:
+                col1, col2 = st.columns(2)
+                with col1:
+                    expand_top_k = st.slider(
+                        "核心页面数",
+                        min_value=3,
+                        max_value=10,
+                        value=expand_top_k,
+                        help="选取重排序后的前K个页面作为核心"
+                    )
+                with col2:
+                    expand_context_size = st.slider(
+                        "上下扩充页数",
+                        min_value=1,
+                        max_value=3,
+                        value=expand_context_size,
+                        help="每个核心页面上下各扩充N页"
+                    )
+                estimated_pages = expand_top_k * (2 * expand_context_size + 1)
+                st.info(f"📊 预计【{estimated_pages}】页上下文，去重后约 20-40 页")
+                estimated_tokens = estimated_pages * 800
+                if estimated_tokens > 25000:
+                    st.error(f"🚨 Token 预估 {estimated_tokens:,}，可能超限，建议降低扩充范围")
+                elif estimated_tokens > 15000:
+                    st.warning(f"⚠️ Token 预估 {estimated_tokens:,}，响应时间可能较长")
+                else:
+                    st.success(f"✅ Token 预估 {estimated_tokens:,}，处于安全范围")
+            else:
+                expand_top_k = 5
+                expand_context_size = 1
+                st.info("💡 当前使用下游扩充，仅在答案生成后补充引用")
+        else:
+            expand_upstream = False
+            expand_top_k = 5
+            expand_context_size = 1
+            st.info("⚠️ 请先启用 LLM 重排序以使用上游扩充")
+    
+    with st.expander("📅 数据与多轮对话", expanded=(selected_step == "data")):
+        if st.session_state.initialized:
+            subset_path = Path("data/val_set/subset.csv")
+            company_name = st.session_state.get("company_name", "金盘科技")
+            available_years = get_available_years(str(subset_path), company_name)
+            if available_years:
+                st.info(f"💡 可用年份: {', '.join(map(str, available_years))}")
+                selected_years = st.multiselect(
+                    "选择特定年份数据（留空=所有年份）",
+                    options=available_years,
+                    default=selected_years,
+                    help="选择特定年份进行检索；不选则默认全量",
+                    key="year_selector"
+                )
+                st.session_state.selected_years = selected_years if selected_years else None
+            else:
+                st.warning("⚠️ 无可用年份，默认在所有年份中检索")
+                st.session_state.selected_years = None
+        else:
+            st.info("ℹ️ 系统尚未初始化，暂无法读取年份信息")
+            st.session_state.selected_years = None
+        
+        enable_multi_turn = st.checkbox(
+            "启用多轮对话",
+            value=st.session_state.enable_multi_turn,
+            help="启用后记住上下文，可能增加token消耗",
+            key="multi_turn_checkbox"
+        )
+        st.session_state.enable_multi_turn = enable_multi_turn
+        if enable_multi_turn:
+            context_turns = st.slider(
+                "保留对话轮数",
+                min_value=1,
+                max_value=10,
+                value=st.session_state.context_turns,
+                step=1,
+                help="设置保留多少轮历史对话作为上下文",
+                key="context_turns_slider"
+            )
+            st.session_state.context_turns = context_turns
+            st.info(f"💡 当前保留最近 **{context_turns}** 轮对话作为上下文")
+        else:
+            st.warning("⚠️ 多轮对话已关闭，每次问答相互独立")
     
     # 检测配置变化
     new_config = {
@@ -824,7 +1313,9 @@ with st.sidebar:
         'rerank_sample_size': rerank_sample_size,
         'expand_upstream': expand_upstream,
         'expand_top_k': expand_top_k,
-        'expand_context_size': expand_context_size
+        'expand_context_size': expand_context_size,
+        'parallel_requests': parallel_requests,
+        'multi_query_methods': selected_multi_query_methods
     }
     
     # 如果配置改变且系统已初始化，需要重新初始化
@@ -876,6 +1367,24 @@ with st.sidebar:
         st.rerun()
     
     st.markdown("---")
+    st.markdown("### 📊 批量评估")
+    
+    if st.button("🚀 一键评估所有问题", use_container_width=True, type="primary"):
+        st.session_state.evaluating = True
+        st.rerun()
+    
+    parallel_requests = st.slider(
+        "🧵 批量评估并发数",
+        min_value=1,
+        max_value=16,
+        value=config_defaults.get('parallel_requests', 4),
+        step=1,
+        help="设置“一键评估”运行时使用的并行线程数（数值越大速度越快，但占用资源更多）",
+        key="parallel_requests_slider"
+    )
+    st.session_state.config['parallel_requests'] = parallel_requests
+    
+    st.markdown("---")
     st.markdown("### 📖 使用说明")
     st.markdown("""
     1. **配置模型**: 选择API提供商和模型
@@ -903,6 +1412,248 @@ if not st.session_state.initialized:
         st.rerun()
     else:
         st.stop()
+
+# 批量评估功能
+if st.session_state.get('evaluating', False):
+    st.session_state.evaluating = False
+    
+    st.markdown("---")
+    st.markdown("## 📊 批量评估进行中...")
+    
+    try:
+        # 加载问题
+        questions_df = pd.read_csv("data/val_set/questions.csv")
+        benchmark_map = load_benchmark_answers("金盘财报查询场景问题benchmark-工作表1.csv")
+        
+        # 创建评估结果目录
+        val_result_dir = Path("data/val_set/val_result")
+        val_result_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 初始化评估结果
+        evaluation_results = []
+        total_questions = len(questions_df)
+        correct_count = 0
+        total_score = 0.0
+        
+        # 收集各阶段时间
+        timing_accumulator = {
+            'init_retriever': [],
+            'retrieval': [],
+            'hyde_expansion': [],
+            'multi_query_expansion': [],
+            'llm_reranking': [],
+            'upstream_expansion': [],
+            'format_results': [],
+            'generate_answer': [],
+            'vector_search': [],
+            'total_time': []
+        }
+        
+        # 创建进度条
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        results_container = st.container()
+        
+        # 初始化API处理器
+        api_processor = APIProcessor(provider="qwen")
+        company_name = st.session_state.company_name
+        config = st.session_state.config
+        
+        # 获取配置信息
+        config_info = {
+            'top_n_retrieval': config.get('top_n_retrieval', 10),
+            'use_hyde': config.get('use_hyde', True),
+            'use_multi_query': config.get('use_multi_query', True),
+            'llm_reranking': config.get('llm_reranking', True),
+            'rerank_sample_size': config.get('llm_reranking_sample_size', 20),
+            'expand_upstream': config.get('expand_upstream', False),
+            'expand_top_k': config.get('expand_top_k', 5),
+            'expand_context_size': config.get('expand_context_size', 2),
+            'answering_model': config.get('answering_model', 'qwen-max'),
+            'api_provider': config.get('api_provider', 'qwen')
+        }
+        
+        # 遍历所有问题
+        for idx, row in questions_df.iterrows():
+            question = str(row.get('提问内容', '')).strip()
+            if not question:
+                continue
+            
+            # 更新进度
+            progress = (idx + 1) / total_questions
+            status_text.text(f"正在评估第 {idx + 1}/{total_questions} 个问题: {question[:50]}...")
+            progress_bar.progress(progress)
+            
+            # 获取标准答案
+            standard_answer = get_standard_answer(question, questions_df, benchmark_map)
+            if not standard_answer:
+                # 如果没有标准答案，跳过
+                evaluation_results.append({
+                    'question': question,
+                    'standard_answer': '',
+                    'rag_answer': '',
+                    'score': 0.0,
+                    'reasoning': '无标准答案，跳过评估',
+                    'is_correct': False,
+                    'skipped': True,
+                    'timing': {}
+                })
+                continue
+            
+            try:
+                # 调用RAG系统获取答案
+                full_question = f"{company_name}{question}" if company_name not in question else question
+                answer_dict = st.session_state.processor.get_answer_for_company(
+                    company_name=company_name,
+                    question=full_question,
+                    schema="jingpan",
+                    conversation_history=None,
+                    progress_callback=None,
+                    selected_years=None
+                )
+                
+                rag_answer = str(answer_dict.get("final_answer", answer_dict.get("answer", "N/A")))
+                
+                # 提取时间信息
+                timing = answer_dict.get('timing', {})
+                if timing:
+                    for key in timing_accumulator:
+                        if key in timing:
+                            timing_accumulator[key].append(timing[key])
+                
+                # 使用LLM as Judge评估
+                eval_result = api_processor.evaluate_answer(
+                    question=question,
+                    standard_answer=standard_answer,
+                    rag_answer=rag_answer,
+                    model="qwen-turbo"
+                )
+                
+                score = eval_result.get('score', 0.0)
+                total_score += score
+                is_correct = score >= 0.8
+                if is_correct:
+                    correct_count += 1
+                
+                evaluation_results.append({
+                    'question': question,
+                    'standard_answer': standard_answer,
+                    'rag_answer': rag_answer,
+                    'score': score,
+                    'reasoning': eval_result.get('reasoning', ''),
+                    'is_correct': is_correct,
+                    'skipped': False,
+                    'timing': timing
+                })
+                
+            except Exception as e:
+                evaluation_results.append({
+                    'question': question,
+                    'standard_answer': standard_answer,
+                    'rag_answer': '',
+                    'score': 0.0,
+                    'reasoning': f'评估失败: {str(e)}',
+                    'is_correct': False,
+                    'skipped': False,
+                    'error': str(e),
+                    'timing': {}
+                })
+        
+        # 完成评估
+        progress_bar.progress(1.0)
+        status_text.text("✅ 评估完成！")
+        
+        # 统计结果
+        evaluated_count = len([r for r in evaluation_results if not r.get('skipped', False)])
+        accuracy = correct_count / evaluated_count if evaluated_count > 0 else 0.0
+        average_score = total_score / evaluated_count if evaluated_count > 0 else 0.0
+        
+        # 计算各阶段平均用时（精确到秒）
+        avg_timing = {}
+        for key, times in timing_accumulator.items():
+            if times:
+                avg_time = sum(times) / len(times)
+                avg_timing[key] = round(avg_time, 2)  # 保留2位小数（精确到0.01秒）
+            else:
+                avg_timing[key] = 0.0
+        
+        # 获取最终检索数量（从配置中）
+        final_retrieval_count = config_info['top_n_retrieval']
+        if config_info.get('expand_upstream', False):
+            # 如果有上游扩充，检索数量会更多
+            final_retrieval_count = f"{config_info['top_n_retrieval']} + 扩充"
+        
+        # 保存结果
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        result_file = val_result_dir / f"evaluation_{timestamp}.json"
+        
+        result_data = {
+            'timestamp': timestamp,
+            'total_questions': total_questions,
+            'evaluated_count': evaluated_count,
+            'correct_count': correct_count,
+            'accuracy': accuracy,
+            'average_score': average_score,
+            'config': config_info,
+            'final_retrieval_count': final_retrieval_count,
+            'average_timing': avg_timing,
+            'results': evaluation_results
+        }
+        
+        with open(result_file, 'w', encoding='utf-8') as f:
+            json.dump(result_data, f, ensure_ascii=False, indent=2)
+        
+        # 显示统计结果
+        with results_container:
+            st.success(f"✅ 评估完成！结果已保存到: {result_file}")
+            
+            col1, col2, col3, col4, col5 = st.columns(5)
+            with col1:
+                st.metric("总问题数", total_questions)
+            with col2:
+                st.metric("已评估", evaluated_count)
+            with col3:
+                st.metric("正确答案", correct_count)
+            with col4:
+                st.metric("正确率", f"{accuracy*100:.2f}%")
+            with col5:
+                st.metric("平均得分", f"{average_score:.3f}")
+            
+            # 显示各阶段平均用时
+            st.markdown("### ⏱️ 各阶段平均用时（秒）")
+            timing_df = pd.DataFrame([
+                {'阶段': '初始化检索器', '平均用时(秒)': avg_timing.get('init_retriever', 0.0)},
+                {'阶段': '向量检索', '平均用时(秒)': avg_timing.get('retrieval', 0.0)},
+                {'阶段': 'HYDE扩展', '平均用时(秒)': avg_timing.get('hyde_expansion', 0.0)},
+                {'阶段': 'Multi-Query扩展', '平均用时(秒)': avg_timing.get('multi_query_expansion', 0.0)},
+                {'阶段': '向量搜索', '平均用时(秒)': avg_timing.get('vector_search', 0.0)},
+                {'阶段': 'LLM重排序', '平均用时(秒)': avg_timing.get('llm_reranking', 0.0)},
+                {'阶段': '上游扩充', '平均用时(秒)': avg_timing.get('upstream_expansion', 0.0)},
+                {'阶段': '格式化结果', '平均用时(秒)': avg_timing.get('format_results', 0.0)},
+                {'阶段': '生成答案', '平均用时(秒)': avg_timing.get('generate_answer', 0.0)},
+                {'阶段': '总用时', '平均用时(秒)': avg_timing.get('total_time', 0.0)},
+            ])
+            st.dataframe(timing_df, use_container_width=True, hide_index=True)
+            
+            # 显示详细结果表格
+            st.markdown("### 📋 详细评估结果")
+            results_df = pd.DataFrame([
+                {
+                    '问题': r['question'][:50] + '...' if len(r['question']) > 50 else r['question'],
+                    '标准答案': r['standard_answer'][:50] + '...' if len(r.get('standard_answer', '')) > 50 else r.get('standard_answer', ''),
+                    'RAG答案': r['rag_answer'][:50] + '...' if len(r.get('rag_answer', '')) > 50 else r.get('rag_answer', ''),
+                    '评分': r['score'],
+                    '是否正确': '✅' if r['is_correct'] else '❌',
+                    '状态': '跳过' if r.get('skipped', False) else '已评估'
+                }
+                for r in evaluation_results
+            ])
+            st.dataframe(results_df, use_container_width=True)
+    
+    except Exception as e:
+        st.error(f"❌ 评估过程出错: {str(e)}")
+        with st.expander("查看详细错误"):
+            st.code(traceback.format_exc())
 
 # 问答区域
 st.markdown("---")
@@ -962,13 +1713,17 @@ if st.button("🚀 获取答案", type="primary", use_container_width=True):
                 status_text.text(stage)
                 progress_bar.progress(progress)
             
+            # 获取选中的年份（如果有）
+            selected_years = st.session_state.get("selected_years", None)
+            
             # 调用问答系统，传入真实的进度回调
             answer_dict = st.session_state.processor.get_answer_for_company(
                 company_name=company_name,
                 question=full_question,
                 schema=schema_type,
                 conversation_history=conversation_history,
-                progress_callback=update_progress
+                progress_callback=update_progress,
+                selected_years=selected_years
             )
             
             # 完成
@@ -981,8 +1736,8 @@ if st.button("🚀 获取答案", type="primary", use_container_width=True):
             progress_bar.empty()
             status_text.empty()
             
-            # 显示答案
-            format_answer_display(answer_dict)
+            # 显示答案（传入问题以便查找标准答案）
+            format_answer_display(answer_dict, full_question)
             
             # 保存到历史
             st.session_state.history.append({
@@ -1013,8 +1768,8 @@ if st.button("🚀 获取答案", type="primary", use_container_width=True):
                 
                 **推荐配置**（适合大部分场景）：
                 - expand_top_k = 5
-                - expand_context_size = 2
-                - 预计Token: ~20,000 ✅
+                - expand_context_size = 1
+                - 预计Token: ~12,000 ✅
                 """)
             else:
                 st.error(f"❌ 处理问题时出错: {error_msg}")
@@ -1025,11 +1780,14 @@ if st.button("🚀 获取答案", type="primary", use_container_width=True):
 # 示例问题（从问题库加载）
 st.markdown("---")
 st.markdown("### 💡 投资者关注问题")
-st.markdown("点击下方问题可自动填入输入框 | 共127个真实投资者问题")
 
 # 加载问题库
 try:
     questions_df = pd.read_csv("data/val_set/questions.csv")
+    total_questions = len(questions_df)
+    st.markdown(f"点击下方问题可自动填入输入框 | 当前共有 **{total_questions}** 个问题")
+
+    ...
     
     # 获取所有问题类型
     question_types = questions_df['问题类型'].unique().tolist()

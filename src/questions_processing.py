@@ -19,7 +19,7 @@ class QuestionsProcessor:
         questions_file_path: Optional[Union[str, Path]] = None,
         new_challenge_pipeline: bool = False,
         subset_path: Optional[Union[str, Path]] = None,
-        parent_document_retrieval: bool = False,
+        parent_document_retrieval: bool = True,
         llm_reranking: bool = False,
         llm_reranking_sample_size: int = 20,
         top_n_retrieval: int = 10,
@@ -31,7 +31,8 @@ class QuestionsProcessor:
         use_multi_query: bool = True,
         expand_upstream: bool = False,
         expand_top_k: int = 5,
-        expand_context_size: int = 2
+        expand_context_size: int = 2,
+        multi_query_methods: Optional[Dict[str, bool]] = None
     ):
         print(f"[QuestionsProcessor] LLM provider: {api_provider}")
         print(f"[QuestionsProcessor] Answering model: {answering_model}")
@@ -56,6 +57,11 @@ class QuestionsProcessor:
         self.expand_upstream = expand_upstream
         self.expand_top_k = expand_top_k
         self.expand_context_size = expand_context_size
+        self.multi_query_methods = multi_query_methods or {
+            'synonym': True,
+            'subquestion': True,
+            'variant': True
+        }
         #print(f"[DEBUG][QuestionsProcessor.__init__] use_hyde={self.use_hyde}, use_multi_query={self.use_multi_query}")
 
         self.answer_details = []
@@ -512,7 +518,7 @@ class QuestionsProcessor:
         
         return validated_pages
 
-    def get_answer_for_company(self, company_name: str, question: str, schema: str, conversation_history: Optional[List[Dict]] = None, progress_callback=None) -> dict:
+    def get_answer_for_company(self, company_name: str, question: str, schema: str, conversation_history: Optional[List[Dict]] = None, progress_callback=None, selected_years: Optional[List[int]] = None) -> dict:
         """
         Get answer for a company's question with optional conversation history.
         
@@ -523,12 +529,34 @@ class QuestionsProcessor:
             conversation_history: Optional list of previous Q&A pairs
                 Format: [{"question": "...", "answer": "..."}, ...]
             progress_callback: Optional callback function(stage: str, progress: int)
+            selected_years: Optional list of years to filter documents (None = all years)
+        
+        Returns:
+            dict: 包含答案和各阶段用时信息
         """
+        import time
+        
+        timing_info = {
+            'init_retriever': 0.0,
+            'retrieval': 0.0,
+            'hyde_expansion': 0.0,
+            'multi_query_expansion': 0.0,
+            'llm_reranking': 0.0,
+            'upstream_expansion': 0.0,
+            'format_results': 0.0,
+            'generate_answer': 0.0,
+            'total_time': 0.0
+        }
+        
+        total_start_time = time.time()
+        
         #print(f"[DEBUG][get_answer_for_company] self.use_hyde={self.use_hyde}, self.use_multi_query={self.use_multi_query}")
         
         # 阶段 1: 初始化检索器
         if progress_callback:
             progress_callback("🔍 分析问题中...", 10)
+        
+        init_start = time.time()
         
         if self.llm_reranking:
             retriever = HybridRetriever(
@@ -536,7 +564,9 @@ class QuestionsProcessor:
                 documents_dir=self.documents_dir,
                 use_hyde=self.use_hyde,
                 use_multi_query=self.use_multi_query,
-                subset_path=self.subset_path
+                subset_path=self.subset_path,
+                parallel_workers=self.parallel_requests,
+                multi_query_methods=self.multi_query_methods
             )
         else:
             retriever = VectorRetriever(
@@ -544,19 +574,26 @@ class QuestionsProcessor:
                 documents_dir=self.documents_dir,
                 use_hyde=self.use_hyde,
                 use_multi_query=self.use_multi_query,
-                subset_path=self.subset_path
+                subset_path=self.subset_path,
+                parallel_workers=self.parallel_requests,
+                multi_query_methods=self.multi_query_methods
             )
+        timing_info['init_retriever'] = time.time() - init_start
 
         # 阶段 2: 召回相关文档
         if progress_callback:
             progress_callback("📚 召回相关文档中...", 25)
         
+        retrieval_start = time.time()
         if self.full_context:
             retrieval_results = retriever.retrieve_all(company_name)
+            timing_info['retrieval'] = time.time() - retrieval_start
         else:
             # 只在VectorRetriever时传递use_hyde和use_multi_query
             # 使用原始问题进行检索（不包含对话历史）
             if isinstance(retriever, VectorRetriever):
+                # 需要在retrieval.py中跟踪HYDE和Multi-Query的时间
+                # 这里先记录总检索时间，具体细分在retrieval.py中处理
                 retrieval_results = retriever.retrieve_by_company_name(
                     company_name=company_name,
                     query=question,
@@ -565,7 +602,9 @@ class QuestionsProcessor:
                     return_parent_pages=self.return_parent_pages,
                     use_hyde=self.use_hyde,
                     use_multi_query=self.use_multi_query,
-                    progress_callback=progress_callback
+                    multi_query_config=self.multi_query_methods,
+                    progress_callback=progress_callback,
+                    selected_years=selected_years
                 )
             else:
                 # HybridRetriever 也需要传递 progress_callback
@@ -575,8 +614,29 @@ class QuestionsProcessor:
                     llm_reranking_sample_size=self.llm_reranking_sample_size,
                     top_n=self.top_n_retrieval,
                     return_parent_pages=self.return_parent_pages,
-                    progress_callback=progress_callback
+                    use_hyde=self.use_hyde,
+                    use_multi_query=self.use_multi_query,
+                    multi_query_config=self.multi_query_methods,
+                    progress_callback=progress_callback,
+                    selected_years=selected_years
                 )
+            timing_info['retrieval'] = time.time() - retrieval_start
+        
+        # 处理检索结果（可能是dict或list）
+        expansion_texts = {}
+        reranker_stats = {}
+        if isinstance(retrieval_results, dict):
+            # 提取扩展文本信息
+            if 'expansion_texts' in retrieval_results:
+                expansion_texts = retrieval_results['expansion_texts']
+            # 提取时间信息
+            if 'timing' in retrieval_results:
+                timing_info.update(retrieval_results['timing'])
+            if 'reranker_stats' in retrieval_results:
+                reranker_stats = retrieval_results['reranker_stats']
+            # 提取结果
+            if 'results' in retrieval_results:
+                retrieval_results = retrieval_results['results']
         
         if not retrieval_results:
             raise ValueError("No relevant context found")
@@ -587,6 +647,7 @@ class QuestionsProcessor:
             if progress_callback:
                 progress_callback("🔄 扩充页面组合中...", 60)
             
+            upstream_start = time.time()
             # 构造页面组合
             page_groups = self._build_page_groups(
                 reranked_results=retrieval_results,
@@ -603,27 +664,115 @@ class QuestionsProcessor:
                 if chunk['page'] not in existing_pages:
                     retrieval_results.append(chunk)
             
+            timing_info['upstream_expansion'] = time.time() - upstream_start
             print(f"[INFO] ✅ 上游扩充完成：{len(retrieval_results)} 个页面（含扩充）")
         
-        # 阶段 3: 格式化检索结果
+        # 阶段 3: 格式化检索结果（用于页面选择）
         if progress_callback:
             progress_callback("📝 整理检索结果中...", 70)
         
-        rag_context = self._format_retrieval_results(retrieval_results)
+        format_start = time.time()
+        all_retrieval_context = self._format_retrieval_results(retrieval_results)
+        timing_info['format_results'] = time.time() - format_start
         
         # 构造带对话历史的问题（用于LLM生成答案）
         question_with_context = self._build_contextual_question(question, conversation_history)
         
-        # 阶段 4: 生成最终答案
+        # 阶段 3.5: 页面选择（两阶段流程的第一步）
+        if progress_callback:
+            progress_callback("🎯 LLM选择相关页面中...", 75)
+        
+        page_selection_start = time.time()
+        import src.prompts as prompts
+        
+        # 使用轻量级提示词进行页面选择
+        page_selection_prompt = prompts.PageSelectionPrompt
+        page_selection_user_prompt = page_selection_prompt.user_prompt.format(
+            question=question,
+            context=all_retrieval_context
+        )
+        
+        # 使用轻量级模型进行页面选择（可以更快更便宜）
+        selection_model = "qwen-turbo" if self.api_provider == "qwen" else self.answering_model
+        
+        page_selection_result = self.openai_processor.processor.send_message(
+            model=selection_model,
+            system_content=page_selection_prompt.system_prompt,
+            human_content=page_selection_user_prompt,
+            is_structured=True,
+            response_format=page_selection_prompt.PageSelectionSchema
+        )
+        
+        # 提取选定的页面
+        selected_pages = page_selection_result.get("selected_pages", [])
+        selection_reasoning = page_selection_result.get("reasoning", "")
+        
+        timing_info['page_selection'] = time.time() - page_selection_start
+        
+        # 验证选定的页面是否在检索结果中
+        retrieved_pages = {result.get('page') for result in retrieval_results if result.get('page') is not None}
+        validated_selected_pages = [p for p in selected_pages if p in retrieved_pages]
+        
+        # 如果验证后没有页面，使用前几个检索结果作为后备
+        if not validated_selected_pages and retrieval_results:
+            print(f"[WARNING] 页面选择结果无效，使用前{min(5, len(retrieval_results))}个检索结果作为后备")
+            validated_selected_pages = [r.get('page') for r in retrieval_results[:5] if r.get('page') is not None]
+        
+        print(f"[INFO] 🎯 页面选择完成：从 {len(retrieval_results)} 个检索结果中选择了 {len(validated_selected_pages)} 个页面")
+        if selection_reasoning:
+            print(f"[INFO] 📝 选择理由：{selection_reasoning}")
+        
+        # 过滤检索结果，只保留选定的页面
+        filtered_retrieval_results = [
+            result for result in retrieval_results 
+            if result.get('page') in validated_selected_pages
+        ]
+        
+        # 阶段 4: 格式化选定的检索结果（用于生成答案）
         if progress_callback:
             progress_callback("✍️ 生成最终答案中...", 80)
         
+        format_selected_start = time.time()
+        rag_context = self._format_retrieval_results(filtered_retrieval_results)
+        timing_info['format_selected_results'] = time.time() - format_selected_start
+        
+        # 获取提示词信息（用于展示）
+        system_prompt, response_format, user_prompt_template = self.openai_processor._build_rag_context_prompts(schema)
+        formatted_user_prompt = user_prompt_template.format(context=rag_context, question=question_with_context)
+        
+        answer_start = time.time()
         answer_dict = self.openai_processor.get_answer_from_rag_context(
             question=question_with_context,
             rag_context=rag_context,
             schema=schema,
             model=self.answering_model
         )
+        timing_info['generate_answer'] = time.time() - answer_start
+        
+        timing_info['total_time'] = time.time() - total_start_time
+        
+        # 将时间信息、提示词信息和扩展文本添加到返回结果中
+        if isinstance(answer_dict, dict):
+            answer_dict['timing'] = timing_info
+            # 保存提示词信息用于展示
+            answer_dict['prompt_info'] = {
+                'system_prompt': system_prompt,
+                'user_prompt': formatted_user_prompt,
+                'rag_context': rag_context,
+                'question': question_with_context,
+                'schema': schema,
+                'model': self.answering_model,
+                # 保存页面选择信息
+                'page_selection': {
+                    'selected_pages': validated_selected_pages,
+                    'selection_reasoning': selection_reasoning,
+                    'all_retrieval_context': all_retrieval_context  # 保存所有检索结果的上下文（用于展示）
+                }
+            }
+            # 保存扩展文本信息用于展示
+            answer_dict['expansion_texts'] = expansion_texts
+            if reranker_stats:
+                answer_dict['reranker_stats'] = reranker_stats
         
         # 防御性检查：确保返回的是字典而不是列表
         if isinstance(answer_dict, list):
@@ -639,10 +788,32 @@ class QuestionsProcessor:
                     "reasoning_summary": "数据格式错误",
                     "relevant_pages": []
                 }
+            
+            # 补充必要的信息（即使出错也要保留这些信息）
+            if isinstance(answer_dict, dict):
+                answer_dict['timing'] = timing_info
+                answer_dict['prompt_info'] = {
+                    'system_prompt': system_prompt,
+                    'user_prompt': formatted_user_prompt,
+                    'rag_context': rag_context,
+                    'question': question_with_context,
+                    'schema': schema,
+                    'model': self.answering_model,
+                    'page_selection': {
+                        'selected_pages': validated_selected_pages,
+                        'selection_reasoning': selection_reasoning,
+                        'all_retrieval_context': all_retrieval_context
+                    }
+                }
+                answer_dict['expansion_texts'] = expansion_texts
+                if reranker_stats:
+                    answer_dict['reranker_stats'] = reranker_stats
         
         self.response_data = self.openai_processor.response_data
         if self.new_challenge_pipeline:
-            pages = answer_dict.get("relevant_pages", [])
+            # 使用页面选择阶段选定的页面（两阶段流程）
+            pages = validated_selected_pages if validated_selected_pages else answer_dict.get("relevant_pages", [])
+            # 验证页面是否在原始检索结果中
             validated_pages = self._validate_page_references(pages, retrieval_results)
             
             # 根据扩充模式处理引用

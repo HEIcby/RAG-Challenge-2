@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import List, Tuple, Dict, Union
+from typing import List, Tuple, Dict, Union, Optional
 from rank_bm25 import BM25Okapi
 import pickle
 from pathlib import Path
@@ -11,6 +11,12 @@ import os
 import re
 import numpy as np
 from src.reranking import LLMReranker
+from src.financial_glossary import (
+    find_financial_concepts,
+    format_concepts_for_prompt,
+)
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 _log = logging.getLogger(__name__)
 
@@ -62,18 +68,20 @@ def route_reports_by_time(
     company_name: str, 
     question: str, 
     all_reports: List[Dict],
-    fallback_strategy: str = "all"  # "all" 或 "latest"
+    fallback_strategy: str = "all",  # "all" 或 "latest"
+    selected_years: List[int] = None  # 可选：前端指定的年份列表
 ) -> List[Dict]:
     """
-    基于时间信息和公司名路由到合适的文档
+    基于公司名和可选年份信息路由到合适的文档
     
     Args:
         company_name: 公司名称
-        question: 用户问题
+        question: 用户问题（不再用于提取年份）
         all_reports: 所有可用的报告
-        fallback_strategy: 当没有时间信息时的回退策略
-            - "all": 返回该公司所有文档
+        fallback_strategy: 当没有指定年份时的回退策略
+            - "all": 返回该公司所有文档（默认）
             - "latest": 只返回最新年份的文档
+        selected_years: 可选，前端指定的年份列表。如果提供，只返回这些年份的文档
     
     Returns:
         List[Dict]: 匹配的报告列表
@@ -89,11 +97,8 @@ def route_reports_by_time(
     if not company_reports:
         return []
     
-    # 2. 提取问题中的年份信息（带时间窗口扩展）
-    years = extract_years_from_question(question, expand_window=True)
-    
-    # 3. 如果有明确年份，只返回对应年份的文档
-    if years:
+    # 2. 如果指定了年份，按年份过滤
+    if selected_years and len(selected_years) > 0:
         filtered_reports = []
         for report in company_reports:
             document = report.get("document", {})
@@ -112,18 +117,18 @@ def route_reports_by_time(
             if report_year is not None:
                 try:
                     report_year = int(report_year)
-                    if report_year in years:
+                    if report_year in selected_years:
                         filtered_reports.append(report)
                 except (ValueError, TypeError):
                     pass
         
         if filtered_reports:
-            print(f"[INFO] 🎯 时间路由（含前后年窗口）: 年份 {years}，匹配到 {len(filtered_reports)} 个文档")
+            print(f"[INFO] 🎯 年份过滤: 选择年份 {selected_years}，匹配到 {len(filtered_reports)} 个文档")
             return filtered_reports
         else:
-            print(f"[WARNING] ⚠️ 识别到年份 {years}，但未找到对应文档，回退到全部文档")
+            print(f"[WARNING] ⚠️ 指定年份 {selected_years}，但未找到对应文档，回退到全部文档")
     
-    # 4. 没有时间信息时的回退策略
+    # 3. 没有指定年份时的回退策略
     if fallback_strategy == "latest":
         # 返回最新年份的文档
         latest_year = None
@@ -150,14 +155,13 @@ def route_reports_by_time(
                         latest_reports.append(report)
                 except (ValueError, TypeError):
                     pass
-                    pass
         
         if latest_reports:
-            print(f"[INFO] 📅 无明确时间信息，使用最新年份 {latest_year} 的文档")
+            print(f"[INFO] 📅 无指定年份，使用最新年份 {latest_year} 的文档")
             return latest_reports
     
-    # 默认返回所有该公司的文档
-    print(f"[INFO] 📚 无明确时间信息，使用该公司所有 {len(company_reports)} 个文档")
+    # 4. 默认返回所有该公司的文档（不再根据问题中的年份过滤）
+    print(f"[INFO] 📚 使用该公司所有 {len(company_reports)} 个文档（所有年份）")
     return company_reports
 
 class BM25Retriever:
@@ -187,10 +191,10 @@ class BM25Retriever:
             print(f"[WARNING] ⚠️ BM25: 无法加载 subset.csv 年份信息: {e}")
         return year_lookup
         
-    def retrieve_by_company_name(self, company_name: str, query: str, top_n: int = 3, return_parent_pages: bool = False) -> List[Dict]:
+    def retrieve_by_company_name(self, company_name: str, query: str, top_n: int = 3, return_parent_pages: bool = False, selected_years: List[int] = None) -> List[Dict]:
         print("BM25Retriever retrieve_by_company_name is called")
         
-        # 🎯 先收集所有文档，然后使用时间路由
+        # 🎯 先收集所有文档，然后使用路由函数
         all_documents = []
         for path in self.documents_dir.glob("*.json"):
             with open(path, 'r', encoding='utf-8') as f:
@@ -201,41 +205,35 @@ class BM25Retriever:
                     "sha1": doc["metainfo"]["sha1_name"]
                 })
         
-        # 使用时间路由过滤文档
-        years = extract_years_from_question(query)
-        matching_documents = []
-        
+        # 转换为 route_reports_by_time 需要的格式
+        all_reports = []
         for doc_info in all_documents:
-            doc = doc_info["document"]
-            metainfo = doc.get("metainfo", {})
-            sha1 = doc_info["sha1"]
-            
-            # 检查公司名
-            if metainfo.get("company_name") != company_name:
-                continue
-            
-            # 如果有年份信息，进一步过滤
-            if years:
-                # 优先从 metainfo 读取，如果没有则从 year_lookup 读取
-                doc_year = metainfo.get("year")
-                if doc_year is None and sha1 in self.year_lookup:
-                    doc_year = self.year_lookup[sha1]
-                
-                if doc_year is not None:
-                    try:
-                        doc_year = int(doc_year)
-                        if doc_year not in years:
-                            continue
-                    except (ValueError, TypeError):
-                        pass
-            
-            matching_documents.append(doc_info)
+            all_reports.append({
+                "document": doc_info["document"],
+                "name": doc_info["sha1"]
+            })
+        
+        # 使用路由函数过滤文档（默认在所有年份中检索，除非指定了 selected_years）
+        matching_reports = route_reports_by_time(
+            company_name=company_name,
+            question=query,
+            all_reports=all_reports,
+            fallback_strategy="all",
+            selected_years=selected_years
+        )
+        
+        # 转换回原来的格式
+        matching_documents = []
+        matching_sha1s = {rep["name"] for rep in matching_reports}
+        for doc_info in all_documents:
+            if doc_info["sha1"] in matching_sha1s:
+                matching_documents.append(doc_info)
         
         if not matching_documents:
             raise ValueError(f"No report found with '{company_name}' company name.")
         
-        if years:
-            print(f"[INFO] 🎯 BM25时间路由: 识别年份 {years}，匹配到 {len(matching_documents)} 个文档")
+        if selected_years and len(selected_years) > 0:
+            print(f"[INFO] 🎯 BM25年份过滤: 选择年份 {selected_years}，匹配到 {len(matching_documents)} 个文档")
         elif len(matching_documents) > 1:
             print(f"[INFO] Found {len(matching_documents)} reports for '{company_name}', retrieving from all")
             
@@ -297,8 +295,25 @@ class BM25Retriever:
         return all_retrieval_results[:top_n]
 
 class HybridRetriever:
-    def __init__(self, vector_db_dir: Path, documents_dir: Path, use_hyde: bool = True, use_multi_query: bool = True, subset_path: Path = None):
-        self.vector_retriever = VectorRetriever(vector_db_dir, documents_dir, use_hyde=use_hyde, use_multi_query=use_multi_query, subset_path=subset_path)
+    def __init__(
+        self,
+        vector_db_dir: Path,
+        documents_dir: Path,
+        use_hyde: bool = True,
+        use_multi_query: bool = True,
+        subset_path: Path = None,
+        parallel_workers: int = 4,
+        multi_query_methods: Optional[Dict[str, bool]] = None,
+    ):
+        self.vector_retriever = VectorRetriever(
+            vector_db_dir,
+            documents_dir,
+            use_hyde=use_hyde,
+            use_multi_query=use_multi_query,
+            subset_path=subset_path,
+            parallel_workers=parallel_workers,
+            multi_query_methods=multi_query_methods,
+        )
         self.reranker = LLMReranker()
         
     def retrieve_by_company_name(
@@ -312,7 +327,9 @@ class HybridRetriever:
         return_parent_pages: bool = False,
         use_hyde: bool = None,
         use_multi_query: bool = None,
-        progress_callback=None
+        progress_callback=None,
+        selected_years: List[int] = None,
+        multi_query_config: Optional[Dict[str, bool]] = None
     ) -> List[Dict]:
         """
         Retrieve and rerank documents using hybrid approach.
@@ -325,20 +342,43 @@ class HybridRetriever:
             top_n: Number of final results to return after reranking
             llm_weight: Weight given to LLM scores (0-1)
             return_parent_pages: Whether to return full pages instead of chunks
+            selected_years: Optional list of years to filter documents
             
         Returns:
             List of reranked document dictionaries with scores
         """
+        import time
+        
+        timing_info = {
+            'hyde_expansion': 0.0,
+            'multi_query_expansion': 0.0,
+            'vector_search': 0.0,
+            'llm_reranking': 0.0
+        }
+        
         # Get initial results from vector retriever
-        vector_results = self.vector_retriever.retrieve_by_company_name(
+        vector_retrieval_result = self.vector_retriever.retrieve_by_company_name(
             company_name=company_name,
             query=query,
             top_n=llm_reranking_sample_size,
             return_parent_pages=return_parent_pages,
             use_hyde=use_hyde,
             use_multi_query=use_multi_query,
-            progress_callback=progress_callback
+            progress_callback=progress_callback,
+            selected_years=selected_years,
+            multi_query_config=multi_query_config
         )
+        
+        # 处理返回结果（可能是dict或list）
+        expansion_texts = {}
+        if isinstance(vector_retrieval_result, dict) and 'timing' in vector_retrieval_result:
+            timing_info.update(vector_retrieval_result['timing'])
+            vector_results = vector_retrieval_result['results']
+            # 提取扩展文本信息
+            if 'expansion_texts' in vector_retrieval_result:
+                expansion_texts = vector_retrieval_result['expansion_texts']
+        else:
+            vector_results = vector_retrieval_result
         
         print(f"[DEBUG] Initial vector results count: {len(vector_results)}")
 
@@ -347,21 +387,40 @@ class HybridRetriever:
             progress_callback("🎯 LLM 重排序中（这可能需要一些时间）...", 58)
         
         # Rerank results using LLM
+        rerank_start = time.time()
         reranked_results = self.reranker.rerank_documents(
             query=query,
             documents=vector_results,
             documents_batch_size=documents_batch_size,
             llm_weight=llm_weight
         )
+        timing_info['llm_reranking'] = time.time() - rerank_start
 
         print(f"[DEBUG] Reranked results count: {len(reranked_results)}")
         #print("[DEBUG] HybridRetriever retrieve_by_company_name is called")
         print(f"[DEBUG] Final top_n: {top_n}")
-        return reranked_results[:top_n]
-
+        
+        final_results = reranked_results[:top_n]
+        
+        # 返回结果、时间信息和扩展文本
+        return {
+            'results': final_results,
+            'timing': timing_info,
+            'expansion_texts': expansion_texts,
+            'reranker_stats': self.reranker.get_stats()
+        }
 
 class VectorRetriever:
-    def __init__(self, vector_db_dir: Path, documents_dir: Path, use_hyde: bool = True, use_multi_query: bool = True, subset_path: Path = None):
+    def __init__(
+        self,
+        vector_db_dir: Path,
+        documents_dir: Path,
+        use_hyde: bool = True,
+        use_multi_query: bool = True,
+        subset_path: Path = None,
+        parallel_workers: int = 4,
+        multi_query_methods: Optional[Dict[str, bool]] = None,
+    ):
         self.vector_db_dir = vector_db_dir
         self.documents_dir = documents_dir
         self.subset_path = subset_path
@@ -370,6 +429,12 @@ class VectorRetriever:
         self.qwen = BaseQwenProcessor()
         self.use_hyde = use_hyde
         self.use_multi_query = use_multi_query
+        self.parallel_workers = max(1, parallel_workers)
+        self.multi_query_methods = multi_query_methods or {
+            'synonym': True,
+            'subquestion': True,
+            'variant': True
+        }
         #print(f"[DEBUG][VectorRetriever.__init__] use_hyde={self.use_hyde}, use_multi_query={self.use_multi_query}")
     
     def _load_year_lookup(self) -> dict:
@@ -462,13 +527,45 @@ class VectorRetriever:
 
     
    
-    def retrieve_by_company_name(self, company_name: str, query: str, llm_reranking_sample_size: int = None, top_n: int = 3, return_parent_pages: bool = False, use_hyde: bool = None, use_multi_query: bool = None, progress_callback=None) -> List[Tuple[str, float]]:
+    def _safe_flush(self):
+        """安全地刷新标准输出，忽略 BrokenPipeError"""
         import sys
-        print("[DEBUG] VectorRetriever retrieve_by_company_name is called")
-        sys.stdout.flush()
+        try:
+            sys.stdout.flush()
+        except (BrokenPipeError, OSError):
+            pass  # 忽略 BrokenPipeError，在 Streamlit 环境中可能发生
+    
+    def _safe_print(self, *args, **kwargs):
+        """安全地打印，忽略 BrokenPipeError"""
+        try:
+            print(*args, **kwargs)
+            self._safe_flush()
+        except (BrokenPipeError, OSError):
+            pass  # 忽略 BrokenPipeError，在 Streamlit 环境中可能发生
+    
+    def retrieve_by_company_name(self, company_name: str, query: str, llm_reranking_sample_size: int = None, top_n: int = 3, return_parent_pages: bool = False, use_hyde: bool = None, use_multi_query: bool = None, progress_callback=None, selected_years: List[int] = None, multi_query_config: Optional[Dict[str, bool]] = None) -> List[Tuple[str, float]]:
+        import sys
+        import time
+        
+        # 初始化时间统计和扩展文本信息
+        timing_info = {
+            'hyde_expansion': 0.0,
+            'multi_query_expansion': 0.0,
+            'embedding_generation': 0.0,
+            'vector_search': 0.0
+        }
+        
+        # 保存扩展生成的文本
+        expansion_texts = {
+            'hyde_text': None,
+            'multi_query_texts': [],
+            'glossary_context': None,
+            'multi_query_methods': {}
+        }
+        
+        self._safe_print("[DEBUG] VectorRetriever retrieve_by_company_name is called")
 
-        # 🎯 使用时间智能路由替代原有的简单公司名过滤
-        # 这样可以根据问题中的时间信息自动定位到对应年份的文档
+        # 🎯 使用路由函数定位文档（默认在所有年份中检索，除非指定了 selected_years）
         if progress_callback:
             progress_callback("📚 定位相关文档中...", 28)
         
@@ -476,7 +573,8 @@ class VectorRetriever:
             company_name=company_name,
             question=query,
             all_reports=self.all_dbs,
-            fallback_strategy="all"  # 无时间信息时使用所有文档
+            fallback_strategy="all",  # 无指定年份时使用所有文档
+            selected_years=selected_years  # 前端指定的年份列表
         )
         
         if not matching_reports:
@@ -484,20 +582,23 @@ class VectorRetriever:
             raise ValueError(f"No report found with '{company_name}' company name.")
         
         if len(matching_reports) > 1:
-            print(f"[INFO] Found {len(matching_reports)} reports for '{company_name}', retrieving from all")
-            sys.stdout.flush()
+            self._safe_print(f"[INFO] Found {len(matching_reports)} reports for '{company_name}', retrieving from all")
             for rep in matching_reports:
                 doc = rep.get("document", {})
                 metainfo = doc.get("metainfo", {})
                 year = metainfo.get("year", "unknown")
-                print(f"  - Report: {rep['name']} (Year: {year})")
-                sys.stdout.flush()
+                self._safe_print(f"  - Report: {rep['name']} (Year: {year})")
         
         # Priority parameters
         use_hyde = self.use_hyde if use_hyde is None else use_hyde
         use_multi_query = self.use_multi_query if use_multi_query is None else use_multi_query
-        print(f"[DEBUG][retrieve_by_company_name] use_hyde={use_hyde}, use_multi_query={use_multi_query}")
-        sys.stdout.flush()
+        multi_query_config = multi_query_config or self.multi_query_methods or {}
+        expansion_texts['multi_query_methods'] = multi_query_config
+        self._safe_print(f"[DEBUG] multi_query_config = {multi_query_config}")
+        if use_multi_query and not any(multi_query_config.values()):
+            self._safe_print("[INFO] Multi-Query enabled but no methods selected; skipping expansion.")
+            use_multi_query = False
+        self._safe_print(f"[DEBUG][retrieve_by_company_name] use_hyde={use_hyde}, use_multi_query={use_multi_query}")
         
         qwen = BaseQwenProcessor()
         # 控制multi_query和hyde扩充
@@ -506,25 +607,44 @@ class VectorRetriever:
         if use_hyde:
             if progress_callback:
                 progress_callback("🔮 HYDE 查询扩展中...", 32)
-            print(f"[DEBUG] 开始 HYDE 扩展...")
-            sys.stdout.flush()
+            self._safe_print(f"[DEBUG] 开始 HYDE 扩展...")
+            hyde_start = time.time()
             try:
-                print(f"[DEBUG] 调用 Qwen API 生成假设答案...")
-                sys.stdout.flush()
+                self._safe_print(f"[DEBUG] 调用 Qwen API 生成假设答案...")
                 fake_answer = qwen.send_message(
                     model="qwen-turbo",
                     system_content=(
-                        "You are a creative report writer. "
-                        "When asked a question, your task is NOT to retrieve real-time or factual financial data, "
-                        "but instead to **invent, compile, or simulate** a helpful passage, article, or news-style report "
-                        "that could plausibly assist in answering the query. "
-                        "Even if the query asks about real numbers or unavailable information, "
-                        "you should respond by **fabricating a coherent, contextually relevant narrative** "
-                        "rather than disclaiming lack of data. "
-                        "Your goal is to produce a well-written piece (report, analysis, or article) "
-                        "that reads like it could come from a newspaper, magazine, or research commentary."
+                        "You are a financial report analyst. Your task is to generate a hypothetical markdown table "
+                        "that could plausibly appear in a company's annual report or financial statement to answer the given query. "
+                        "\n\n"
+                        "**Requirements:**\n"
+                        "1. Generate a markdown-format table (using | and - for formatting)\n"
+                        "2. The table should be relevant to the question and contain typical fields/columns that would appear in such a table\n"
+                        "3. Include appropriate table headers (such as: 类型, 项目, 金额, 单位, 备注, 年份, 季度, 比例, etc.)\n"
+                        "4. Add a unit specification if applicable (e.g., '单位：万元' or '单位：元')\n"
+                        "5. Include sample data rows that demonstrate the table structure\n"
+                        "6. The table structure should match what would typically appear in Chinese financial reports\n"
+                        "\n"
+                        "**Table Format Example:**\n"
+                        "```\n"
+                        "单位：万元\n\n"
+                        "| 类型 | 项目 | 金额 | 备注 |\n"
+                        "|------|------|------|------|\n"
+                        "| ...  | ...  | ...  | ...  |\n"
+                        "```\n"
+                        "\n"
+                        "**Important:**\n"
+                        "- Focus on creating a realistic table structure, not accurate data\n"
+                        "- The table should help retrieve similar tables from financial reports\n"
+                        "- Use Chinese column names appropriate for financial statements\n"
+                        "- Include calculation formulas or notes if relevant (e.g., '① ② ③ = +' or '⑥ ① ④ ⑤ = - -')"
                     ),
-                    human_content=f"Write a full passage to address this query in an informative and narrative way: {query}",
+                    human_content=f"Generate a markdown-format table that could appear in a company's financial report to answer this question: {query}\n\n"
+                                 f"The table should include:\n"
+                                 f"- Appropriate unit specification (if applicable)\n"
+                                 f"- Relevant column headers based on the question\n"
+                                 f"- Sample data rows showing the table structure\n"
+                                 f"- Any relevant notes or calculation formulas",
                     is_structured=False
                 )
                 if isinstance(fake_answer, list):
@@ -532,106 +652,173 @@ class VectorRetriever:
                 else:
                     fake_answer_str = str(fake_answer)
                 queries.append(fake_answer_str)
-                print(f"[DEBUG] HYDE 扩展成功，生成假设答案长度: {len(fake_answer_str)}")
-                sys.stdout.flush()
+                expansion_texts['hyde_text'] = fake_answer_str  # 保存HYDE生成的文本
+                self._safe_print(f"[DEBUG] HYDE 扩展成功，生成假设答案长度: {len(fake_answer_str)}")
             except Exception as e:
-                print(f"[ERROR] HYDE expansion failed: {e}")
-                sys.stdout.flush()
+                self._safe_print(f"[ERROR] HYDE expansion failed: {e}")
+            timing_info['hyde_expansion'] = time.time() - hyde_start
 
         if use_multi_query:
             if progress_callback:
                 progress_callback("🔄 Multi-Query 查询扩展中...", 38)
-            print(f"[DEBUG] 开始 Multi-Query 扩展...")
-            sys.stdout.flush()
-            # expansion_methods = {
-            #     1: "Expand the question by replacing key terms with synonyms or related terms while keeping the meaning in the context of annual reports and financial statements. Generate three queries, each wrapped in <>.",
-            #     2: "Expand the question by including broader or narrower related terms (hypernyms or hyponyms) relevant to annual reports and financial statements. Generate three queries, each wrapped in <>.",
-            #     3: "Rewrite the question into three paraphrased variations that keep the same intent in the context of annual reports and financial statements. Generate three queries, each wrapped in <>."
-            # }
-            expansion_methods = {
-                1: "Expand the question by replacing key terms with synonyms or related terms while keeping the meaning in the context of annual reports and financial statements. Generate one query, wrapped in <>.",
-                2: "Expand the question by including broader or narrower related terms (hypernyms or hyponyms) relevant to annual reports and financial statements. Generate one query, wrapped in <>.",
-                3: "Rewrite the question into one paraphrased variation that keeps the same intent in the context of annual reports and financial statements. Generate one query, wrapped in <>."
-            }
+            self._safe_print(f"[DEBUG] 开始 Multi-Query 扩展...")
+            multi_query_start = time.time()
+            matched_concepts = find_financial_concepts(query, limit=5)
+            concept_terms = [concept["term"] for concept in matched_concepts]
+            concept_context_text = format_concepts_for_prompt(matched_concepts)
+            glossary_instruction = (
+                "Financial glossary context.\n"
+                "For每个命中的术语，请按照以下格式逐条追加解释：\n"
+                "1) Term名 + 主要别名/近义词\n"
+                "2) 定义（至少一句）\n"
+                "3) 计算方法/典型单位/数据来源（若适用）\n"
+                "格式示例：\n"
+                "\"毛利率\n"
+                "- 别名：综合毛利率\n"
+                "- 定义：体现产品盈利空间的比例……\n"
+                "- 计算方式：毛利率 = (营业收入 - 营业成本) ÷ 营业收入\"\n"
+                "在生成新的查询时，将上述解释附加在原问题后方的独立段落中，而不是写在括号里。\n"
+                f"{concept_context_text}"
+            )
+            expansion_texts['glossary_context'] = concept_context_text
+            expansion_texts['multi_query_methods'] = multi_query_config
+            method_definitions = [
+                (
+                    1,
+                    'synonym',
+                    "你的任务是为问题中的财务专业名词补充详细解释。"
+                    "上面已提供了财务术语词汇表(Financial glossary)，包含每个术语的别名、定义和计算方式。"
+                    "任务要求：识别问题中包含的财务术语，参考 glossary 中的信息，在原问题之后单独列出每个术语的定义、近义词、计算方法。"
+                    "格式：<原问题 名词解释：术语名称 定义...近义词...计算方法...>"
+                    "示例：金盘科技2024年的毛利率是多少 -> "
+                    "<金盘科技2024年的毛利率是多少 名词解释：毛利率 定义：毛利与营业收入之比，反映产品或业务的盈利空间 近义词：综合毛利率 计算方法：毛利率=(营业收入-营业成本)/营业收入>"
+                    "优先使用 glossary 中提供的定义、近义词和计算方式。如果问题涉及财务术语但 glossary 中没有，可以用你自己的知识补充。"
+                    "只有在问题完全不涉及任何财务术语时，才返回 <SKIP>。可生成1-2个带名词解释的查询，每个用尖括号包裹。"
+                ),
+                (
+                    2,
+                    'subquestion',
+                    "根据财务指标将问题拆分为0-N个粒度更细的子问题。"
+                    "每个子问题专注于单一指标/时间段/业务板块，并结合 glossary 里的术语或单位。"
+                    "若没有合适的拆分则返回 <SKIP>；否则每个子问题单独用 <> 包裹。"
+                ),
+                (
+                    3,
+                    'variant',
+                    "仅当原问题偏开放或信息不足时，生成情景化/变体提问，探索不同角度（如盈利质量、现金安全垫、海外扩张、补贴持续性等）。"
+                    "若问题本就明确，则输出 <SKIP>；若需要改写，可生成1-2个查询，每个用 <> 包裹，并保持主体为金盘科技。"
+                )
+            ]
             import re
-            for method_id, prompt in expansion_methods.items():
-                print(f"[DEBUG] Multi-Query 方法 {method_id}...")
-                sys.stdout.flush()
+            for method_id, method_key, prompt in method_definitions:
+                if not multi_query_config.get(method_key, False):
+                    continue
+                self._safe_print(f"[DEBUG] Multi-Query 方法 {method_id}...")
                 try:
-                    print(f"[DEBUG] 调用 Qwen API 扩展查询...")
-                    sys.stdout.flush()
+                    self._safe_print(f"[DEBUG] 调用 Qwen API 扩展查询...")
                     response = qwen.send_message(
                         model="qwen-turbo",
-                        system_content="You are assisting in an Enterprise RAG Challenge focused on annual reports.",
-                        human_content=f"{prompt}\nOriginal question: {query}",
+                        system_content=(
+                            "You are assisting in an Enterprise RAG Challenge focused on annual reports. "
+                            "Always maintain financial rigor and keep the company name unchanged."
+                        ),
+                        human_content=(
+                            f"{prompt}\n\n"
+                            f"{glossary_instruction}\n\n"
+                            f"Original question: {query}"
+                        ),
                         is_structured=False
                     )
                     extracted_queries = re.findall(r"<(.*?)>", response, flags=re.DOTALL)
+                    self._safe_print(f"[DEBUG] 原始响应: {response[:200]}...")
+                    self._safe_print(f"[DEBUG] 提取的查询: {extracted_queries}")
                     for q in extracted_queries:
-                        queries.append(q.strip())
-                    print(f"[DEBUG] Multi-Query 方法 {method_id} 完成，提取了 {len(extracted_queries)} 个查询")
-                    sys.stdout.flush()
+                        q_stripped = q.strip()
+                        self._safe_print(f"[DEBUG] 处理查询: '{q_stripped[:50]}...' (SKIP={q_stripped.upper() == 'SKIP'})")
+                        if not q_stripped or q_stripped.upper() == "SKIP":
+                            continue
+                        queries.append(q_stripped)
+                        expansion_texts['multi_query_texts'].append({
+                            'method_id': method_id,
+                            'query': q_stripped,
+                            'concepts': concept_terms
+                        })
+                    self._safe_print(f"[DEBUG] Multi-Query 方法 {method_id} 完成，提取了 {len(extracted_queries)} 个查询，实际添加了 {len([q for q in extracted_queries if q.strip() and q.strip().upper() != 'SKIP'])} 个")
                 except Exception as e:
-                    print(f"Expansion method {method_id} failed: {e}")
+                    self._safe_print(f"Expansion method {method_id} failed: {e}")
+            timing_info['multi_query_expansion'] = time.time() - multi_query_start
         
+        # 去重并清洗查询，避免重复 embedding 计算
+        deduped_queries = []
+        seen_queries = set()
+        for q in queries:
+            normalized_q = q.strip()
+            if not normalized_q or normalized_q in seen_queries:
+                continue
+            deduped_queries.append(normalized_q)
+            seen_queries.add(normalized_q)
+        queries = deduped_queries
+
+        inner_factor = 1.0
+        self._safe_print("[DEBUG] queries is", queries)
+        self._safe_print("[DEBUG] queries's length is", len(queries))
+
+        # 预先生成 embeddings，避免在不同文档之间重复请求
+        query_embeddings = {}
+        embedding_start = time.time()
+        for q in queries:
+            try:
+                emb_result = self.qwen.get_embeddings([q])
+                if (
+                    not emb_result
+                    or not isinstance(emb_result, list)
+                    or not emb_result[0]
+                    or 'embedding' not in emb_result[0]
+                ):
+                    self._safe_print(f"[ERROR] embedding result is empty or invalid for query: {q[:80]}")
+                    continue
+                embedding = emb_result[0]['embedding']
+                query_embeddings[q] = np.array(embedding, dtype=np.float32).reshape(1, -1)
+            except Exception as e:
+                self._safe_print(f"[ERROR] Failed to get embedding for query snippet '{q[:50]}': {e}")
+        timing_info['embedding_generation'] = time.time() - embedding_start
+
+        if not query_embeddings:
+            raise ValueError("Failed to generate embeddings for all queries.")
+
         # 命中结果存储（用字典聚合）
         # key = (sha1, page_id or chunk_id), value = dict with distances, count, text
         aggregated_results = {}
+        aggregation_lock = Lock()
 
-        inner_factor = 1.0
-        print("[DEBUG] queries is", queries)
-        print("[DEBUG] queries's length is", len(queries))
-
-        # 🎯 智能分配策略：将 top_n 平均分配到每个匹配的文档
-        # 这样可以确保每个文档都有公平的机会被检索到
-        # 避免单个文档dominate所有结果
+        # 🎯 新检索策略：每个文档均召回 top_n 个chunks，然后统一按向量相似度排序
+        # 收集所有文档的检索结果（总共 num_reports * top_n 个结果），
+        # 统一按向量相似度（加权后的distance）排序，截断式选取前 top_n 个结果
         num_reports = len(matching_reports)
-        top_n_per_report = max(1, top_n // num_reports)  # 确保至少为1
-        remaining = top_n % num_reports  # 余数分配给前几个文档
         
-        print(f"[INFO] 📊 检索策略: {num_reports}个文档, 每个分配约{top_n_per_report}个chunks (总预算{top_n})")
-        if remaining > 0:
-            print(f"[INFO] 💡 前{remaining}个文档额外获得1个chunk配额")
+        self._safe_print(f"[INFO] 📊 检索策略: {num_reports}个文档, 每个文档检索 {top_n} 个chunks (总计最多 {num_reports * top_n} 个结果)")
 
         # 向量检索阶段
         if progress_callback:
             progress_callback("🔎 向量检索中...", 45)
 
-        # Process each matching report
-        for idx, report in enumerate(matching_reports):
-            document = report["document"]
-            vector_db = report["vector_db"]
-            chunks = document["content"]["chunks"]
-            pages = document["content"]["pages"]
-            sha1 = document["metainfo"]["sha1_name"]
-            
-            # 为每个文档分配合适的 top_n
-            doc_top_n = top_n_per_report + (1 if idx < remaining else 0)
-            actual_top_n = min(doc_top_n, len(chunks))
-            
-            print(f"[DEBUG] 从 {sha1} 检索 {actual_top_n} 个chunks (共{len(chunks)}个)")
-            
-            # Retrieve for each query
-            for q in queries:
-                if not q.strip():
-                    print(f"[ERROR] query is empty, skip embedding: '{q}'")
-                    continue
-                emb_result = self.qwen.get_embeddings([q])
-                if not emb_result or not isinstance(emb_result, list) or not emb_result[0] or 'embedding' not in emb_result[0]:
-                    print(f"[ERROR] embedding result is empty or invalid for query: {q}, emb_result: {emb_result}")
-                    continue
-                print("[DEBUG] emb_result[0] =", emb_result[0])
-                embedding = emb_result[0]['embedding']
-                embedding_array = np.array(embedding, dtype=np.float32).reshape(1, -1)
+        def process_query_for_document(report, query_text, embedding_array):
+            local_hits = []
+            try:
+                document = report["document"]
+                vector_db = report["vector_db"]
+                chunks = document["content"]["chunks"]
+                pages = document["content"]["pages"]
+                sha1 = document["metainfo"]["sha1_name"]
+                actual_top_n = min(top_n, len(chunks))
+                if actual_top_n == 0:
+                    return []
                 distances, indices = vector_db.search(x=embedding_array, k=actual_top_n)
             
                 for distance, index in zip(distances[0], indices[0]):
                     distance = round(float(distance)*inner_factor, 4)
                     chunk = chunks[index]
                     parent_page = next(page for page in pages if page["page"] == chunk["page"])
-                    
-                    # Debug: 打印每个文档的检索结果
-                    print(f"[DEBUG] Retrieved from {sha1}: page={chunk['page']}, distance={distance}, text_preview={chunk['text'][:50]}...")
                     
                     if return_parent_pages:
                         # Include sha1 in key to differentiate same page numbers across different reports
@@ -643,17 +830,40 @@ class VectorRetriever:
                         text = chunk["text"]
                         page_id = chunk["page"]
                     
-                    if key not in aggregated_results:
-                        aggregated_results[key] = {
-                            "page": page_id,
-                            "text": text,
-                            "distances": [distance],
-                            "count": 1,
-                            "source_sha1": sha1  # Track source document
-                        }
-                    else:
-                        aggregated_results[key]["distances"].append(distance)
-                        aggregated_results[key]["count"] += 1
+                    local_hits.append((key, page_id, text, distance, sha1))
+            except Exception as e:
+                self._safe_print(f"[ERROR] Vector search failed for query '{query_text[:60]}' in report {report.get('name')}: {e}")
+            return local_hits
+
+        total_tasks = len(query_embeddings) * num_reports
+        max_workers = min(self.parallel_workers, total_tasks) if total_tasks > 0 else 1
+        vector_search_start = time.time()
+
+        with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
+            futures = []
+            for report in matching_reports:
+                for q_text, embedding_array in query_embeddings.items():
+                    futures.append(executor.submit(process_query_for_document, report, q_text, embedding_array))
+
+            for future in as_completed(futures):
+                doc_hits = future.result()
+                if not doc_hits:
+                    continue
+                with aggregation_lock:
+                    for key, page_id, text, distance, sha1 in doc_hits:
+                        if key not in aggregated_results:
+                            aggregated_results[key] = {
+                                "page": page_id,
+                                "text": text,
+                                "distances": [distance],
+                                "count": 1,
+                                "source_sha1": sha1  # Track source document
+                            }
+                        else:
+                            aggregated_results[key]["distances"].append(distance)
+                            aggregated_results[key]["count"] += 1
+
+        timing_info['vector_search'] = time.time() - vector_search_start
     
         # 加权规则: 1次=×1.0, 2次=×1.2, 3次=×1.4。. 以此类推。 注意：当前 faiss 用的是 IndexFlatIP（内积），distance 越大表示相关性越高。因此，命中多次时，应该让 distance 增大。
         def weight_factor(count: int) -> float:
@@ -699,8 +909,12 @@ class VectorRetriever:
         for sha1, count in sorted(source_counts.items(), key=lambda x: -x[1]):
             print(f"  {sha1}: {count} results")
         
-    
-        return final_results
+        # 将时间信息、扩展文本与结果一起返回
+        return {
+            'results': final_results,
+            'timing': timing_info,
+            'expansion_texts': expansion_texts
+        }
 
     def retrieve_all(self, company_name: str) -> List[Dict]:
         """Retrieve all pages from all reports matching the company name."""

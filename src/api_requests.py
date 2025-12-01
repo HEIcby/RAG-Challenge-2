@@ -29,6 +29,14 @@ class BaseQwenProcessor:
             self.base_url = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
             self.default_model = "qwen-turbo"  # 可根据实际模型名调整
             self.response_data = None  # 新增：用于保存最近一次API响应内容
+        
+        def _safe_flush(self):
+            """安全地刷新标准输出，忽略 BrokenPipeError"""
+            import sys
+            try:
+                sys.stdout.flush()
+            except (BrokenPipeError, OSError):
+                pass  # 忽略 BrokenPipeError，在 Streamlit 环境中可能发生
 
         @retry(
             wait=wait_fixed(50),
@@ -80,7 +88,7 @@ class BaseQwenProcessor:
             for i in range(0, len(texts_clean), batch_size):
                 batch = texts_clean[i:i + batch_size]
                 print(f"[DEBUG] [Dashscope Embedding] Batch {i//batch_size + 1}, size: {len(batch)}")
-                sys.stdout.flush()
+                self._safe_flush()
                 try:
                     resp = dashscope.TextEmbedding.call(
                         model=model,
@@ -89,7 +97,7 @@ class BaseQwenProcessor:
                         output_type="dense"
                     )
                     print(f"[DEBUG] [Dashscope Embedding] Status: {resp.get('status_code')}")
-                    sys.stdout.flush()
+                    self._safe_flush()
 
                     if resp.get('status_code') == 200:
                         embeddings = resp.get('output', {}).get('embeddings', [])
@@ -151,12 +159,12 @@ class BaseQwenProcessor:
             import sys
             response = requests.post(self.base_url, headers=headers, json=payload, timeout=60)
             print(f"[DEBUG] [Qwen API] Status: {response.status_code}, Response length: {len(response.text)} bytes")
-            sys.stdout.flush()
+            self._safe_flush()
             
             # 如果状态码不是200，打印错误详情
             if response.status_code != 200:
                 print(f"[ERROR] [Qwen API] Full error response: {response.text}")
-                sys.stdout.flush()
+                self._safe_flush()
             
             response.raise_for_status()
             result = response.json()
@@ -533,7 +541,7 @@ class BaseGeminiProcessor:
     ) -> Union[str, Dict, None]:
         import sys
         print(f"[DEBUG] [Gemini] send_message 调用开始，model={model}")
-        sys.stdout.flush()
+        self._safe_flush()
         
         if model is None:
             model = self.default_model
@@ -542,7 +550,7 @@ class BaseGeminiProcessor:
         
         prompt = f"{system_content}\n\n---\n\n{human_content}"
         print(f"[DEBUG] [Gemini] 准备调用 API，prompt 长度: {len(prompt)}")
-        sys.stdout.flush()
+        self._safe_flush()
 
         model_instance = self.llm.GenerativeModel(
             model_name=model,
@@ -551,10 +559,10 @@ class BaseGeminiProcessor:
 
         try:
             print(f"[DEBUG] [Gemini] 开始 API 调用...")
-            sys.stdout.flush()
+            self._safe_flush()
             response = self._generate_with_retry(model_instance, prompt, generation_config)
             print(f"[DEBUG] [Gemini] API 调用成功")
-            sys.stdout.flush()
+            self._safe_flush()
 
             self.response_data = {
                 "model": response.model_version,
@@ -562,17 +570,17 @@ class BaseGeminiProcessor:
                 "output_tokens": response.usage_metadata.candidates_token_count
             }
             print(f"[DEBUG] [Gemini] Response data: {self.response_data}")
-            sys.stdout.flush()
+            self._safe_flush()
             
             if is_structured and response_format is not None:
                 return self._parse_structured_response(response.text, response_format)
             
             print(f"[DEBUG] [Gemini] 返回响应，长度: {len(response.text)}")
-            sys.stdout.flush()
+            self._safe_flush()
             return response.text
         except Exception as e:
             print(f"[ERROR] [Gemini] API request failed: {str(e)}")
-            sys.stdout.flush()
+            self._safe_flush()
             raise Exception(f"API request failed after retries: {str(e)}")
 
 
@@ -629,6 +637,88 @@ class APIProcessor:
         # 移除对 self.processor.response_data 的访问，避免 AttributeError
         return answer_dict
 
+    def _detect_question_type(self, question: str, standard_answer: str) -> str:
+        """
+        判断问题类型：数字类、是否类、开放类
+        
+        Args:
+            question: 问题
+            standard_answer: 标准答案
+        
+        Returns:
+            "number", "boolean", 或 "open"
+        """
+        import re
+        
+        # 是否类问题关键词
+        boolean_keywords = ['是否', '有没有', '会不会', '能否', '可不可以', '会不会', '能否', '会否', '有没有', '有没有']
+        if any(keyword in question for keyword in boolean_keywords):
+            return "boolean"
+        
+        # 数字类问题关键词
+        number_keywords = ['多少', '多大', '几个', '几', '多少', '是多少', '增长率', '占比', '比例', '金额', '收入', '利润', '资产', '负债', '成本', '费用', '元', '万元', '亿元', '%', '百分比']
+        if any(keyword in question for keyword in number_keywords):
+            # 进一步检查标准答案中是否有明确的数字
+            if re.search(r'\d+[\.\d]*', standard_answer):
+                return "number"
+        
+        # 默认是开放类问题
+        return "open"
+    
+    def evaluate_answer(self, question: str, standard_answer: str, rag_answer: str, model: str = "qwen-turbo"):
+        """
+        使用LLM as Judge评估RAG答案与标准答案的匹配度
+        
+        Args:
+            question: 问题
+            standard_answer: 标准答案
+            rag_answer: RAG生成的答案
+            model: 评估模型（默认qwen-turbo）
+        
+        Returns:
+            评估结果字典，包含score, reasoning, is_correct
+        """
+        import src.prompts as prompts
+        
+        eval_prompt = prompts.AnswerEvaluationPrompt
+        
+        # 判断问题类型
+        question_type = self._detect_question_type(question, standard_answer)
+        
+        # 根据问题类型选择相应的提示词
+        if question_type == "number":
+            system_prompt = eval_prompt.system_prompt_number if self.provider in ["ibm", "gemini"] else eval_prompt.system_prompt_number
+            user_prompt = eval_prompt.user_prompt_number.format(
+                question=question,
+                standard_answer=standard_answer,
+                rag_answer=rag_answer
+            )
+        elif question_type == "boolean":
+            system_prompt = eval_prompt.system_prompt_boolean if self.provider in ["ibm", "gemini"] else eval_prompt.system_prompt_boolean
+            user_prompt = eval_prompt.user_prompt_boolean.format(
+                question=question,
+                standard_answer=standard_answer,
+                rag_answer=rag_answer
+            )
+        else:  # open
+            system_prompt = eval_prompt.system_prompt_open if self.provider in ["ibm", "gemini"] else eval_prompt.system_prompt_open
+            user_prompt = eval_prompt.user_prompt_open.format(
+                question=question,
+                standard_answer=standard_answer,
+                rag_answer=rag_answer
+            )
+        
+        response_format = eval_prompt.EvaluationSchema
+        
+        evaluation_result = self.processor.send_message(
+            model=model,
+            system_content=system_prompt,
+            human_content=user_prompt,
+            is_structured=True,
+            response_format=response_format
+        )
+        
+        return evaluation_result
 
     def _build_rag_context_prompts(self, schema):
         """Return prompts tuple for the given schema."""

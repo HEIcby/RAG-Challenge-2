@@ -1,10 +1,33 @@
 import os
+import time
+from threading import Lock
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 from openai import OpenAI
 import requests
 import src.prompts as prompts
-from concurrent.futures import ThreadPoolExecutor
 from tenacity import retry, wait_fixed, stop_after_attempt
+
+
+class RateLimiter:
+    """Simple token-based rate limiter to avoid hitting provider QPS limits."""
+
+    def __init__(self, rate_per_second: float = 0.0):
+        self.interval = 1.0 / rate_per_second if rate_per_second and rate_per_second > 0 else 0.0
+        self._lock = Lock()
+        self._next_available_time = 0.0
+
+    def acquire(self):
+        """Block until the next request is allowed."""
+        if self.interval <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            if self._next_available_time > now:
+                wait_time = self._next_available_time - now
+                time.sleep(wait_time)
+                now = time.monotonic()
+            self._next_available_time = now + self.interval
 
 
 class JinaReranker:
@@ -43,23 +66,72 @@ class LLMReranker:
         load_dotenv()
         self.provider = provider or os.getenv("LLM_RERANK_PROVIDER", "qwen")
         print(f"[LLMReranker] Using provider: {self.provider}")
-        #self.model = model or os.getenv("LLM_RERANK_MODEL", "qwen-turbo")
-        self.model = model or os.getenv("LLM_RERANK_MODEL", "qwen-max-latest")
+        self.model = model or os.getenv("LLM_RERANK_MODEL", "qwen-plus")
         print(f"[LLMReranker] Using model: {self.model}")
         # 并发限制：阿里云 Dashscope API 通常限制在 10-20 QPS
         self.max_concurrent_requests = max_concurrent_requests
         print(f"[LLMReranker] Max concurrent requests: {self.max_concurrent_requests}")
+        self.rate_limit_qps = float(os.getenv("LLM_RERANK_QPS", "5"))
+        self.rate_limiter = RateLimiter(self.rate_limit_qps)
+        self.batch_retry_limit = int(os.getenv("LLM_RERANK_BATCH_RETRY", "1"))
+        self.failure_threshold = int(os.getenv("LLM_RERANK_FAILURE_THRESHOLD", "3"))
         self.qwen_api_key = os.getenv("QWEN_API_KEY")
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
         self.system_prompt_rerank_single_block = prompts.RerankingPrompt.system_prompt_rerank_single_block
         self.system_prompt_rerank_multiple_blocks = prompts.RerankingPrompt.system_prompt_rerank_multiple_blocks
         self.schema_for_single_block = prompts.RetrievalRankingSingleBlock
         self.schema_for_multiple_blocks = prompts.RetrievalRankingMultipleBlocks
+        self._stats_lock = Lock()
+        self.reset_stats()
         if self.provider == "openai":
             from openai import OpenAI
             self.llm = OpenAI(api_key=self.openai_api_key)
         else:
             self.llm = None  # Qwen uses HTTP API
+
+    def reset_stats(self):
+        with self._stats_lock:
+            self.stats = {
+                "total_requests": 0,
+                "successful_requests": 0,
+                "failed_requests": 0,
+                "batch_fallbacks": 0,
+                "missing_rankings": 0,
+                "avg_llm_latency": 0.0,
+                "last_error": None,
+            }
+            self._latency_accumulator = 0.0
+
+    def _record_success(self, duration: float):
+        with self._stats_lock:
+            self.stats["successful_requests"] += 1
+            self._latency_accumulator += duration
+            if self.stats["successful_requests"] > 0:
+                self.stats["avg_llm_latency"] = round(
+                    self._latency_accumulator / self.stats["successful_requests"],
+                    4,
+                )
+
+    def _record_failure(self, error_message: str = None):
+        with self._stats_lock:
+            self.stats["failed_requests"] += 1
+            if error_message:
+                self.stats["last_error"] = error_message
+
+    def increment_stat(self, key: str, value: int = 1):
+        with self._stats_lock:
+            self.stats[key] = self.stats.get(key, 0) + value
+
+    def get_stats(self):
+        with self._stats_lock:
+            stats_copy = dict(self.stats)
+        total = stats_copy.get("total_requests", 0)
+        successful = stats_copy.get("successful_requests", 0)
+        stats_copy["success_rate"] = round(successful / total, 4) if total else 0.0
+        stats_copy["request_rate_limit"] = self.rate_limit_qps
+        stats_copy["max_concurrent_requests"] = self.max_concurrent_requests
+        return stats_copy
+
 
     @retry(wait=wait_fixed(50), stop=stop_after_attempt(3), before_sleep=_log_retry_attempt)
     def _qwen_send(self, system_content, user_content, response_format=None):
@@ -76,6 +148,9 @@ class LLMReranker:
         import sys
         print(f"[DEBUG] [Reranker] 调用 Dashscope API...")
         sys.stdout.flush()
+        self.rate_limiter.acquire()
+        start_time = time.time()
+        self.increment_stat("total_requests")
         try:
             response = Generation.call(
                 api_key=api_key,
@@ -88,11 +163,14 @@ class LLMReranker:
         except Exception as e:
             print(f"[ERROR] dashscope Generation.call exception: {e}")
             sys.stdout.flush()
+            self._record_failure(str(e))
             raise  # 让retry捕获异常并重试
 
         if hasattr(response, 'status_code') and response.status_code == 200:
             #print("[DEBUG] Qwen API call response is:", response)
             content = response.output.choices[0].message.content
+            duration = time.time() - start_time
+            self._record_success(duration)
             if response_format is not None:
                 from json_repair import repair_json
                 import json
@@ -101,6 +179,7 @@ class LLMReranker:
                     return json.loads(repaired_json)
                 except Exception as e:
                     print(f"[ERROR] json_repair failed: {e}, content: {content}")
+                    self._record_failure(str(e))
                     return {"block_rankings": []}
             else:
                 return content
@@ -111,7 +190,9 @@ class LLMReranker:
             print("For more information, see: https://www.alibabacloud.com/help/en/model-studio/error-code")
             # 如果是限流错误则抛出异常，触发retry
             if getattr(response, 'status_code', None) == 429 or getattr(response, 'code', None) == 'Throttling.AllocationQuota':
+                self._record_failure("Throttling.AllocationQuota")
                 raise Exception(f"Qwen API throttling: {getattr(response, 'message', None)}")
+            self._record_failure(getattr(response, 'message', None))
             return {"block_rankings": []}
 
 
@@ -214,87 +295,85 @@ class LLMReranker:
             llm_weight: Weight for LLM score (default: 0.7)
             progress_callback: Optional callback for progress updates
         """
-        # Create batches of documents
+        self.reset_stats()
         doc_batches = [documents[i:i + documents_batch_size] for i in range(0, len(documents), documents_batch_size)]
         vector_weight = 1 - llm_weight
-        
-        print(f"[LLMReranker] Processing {len(documents)} documents in {len(doc_batches)} batches with max {self.max_concurrent_requests} concurrent requests")
-        
-        if documents_batch_size == 1:
-            def process_single_doc(doc):
-                # Add source information to text for reranking context
-                source_sha1 = doc.get('source_sha1', 'Unknown')
-                text_with_source = f"[来源: {source_sha1}]\n{doc['text']}"
-                
-                # Get ranking for single document
-                ranking = self.get_rank_for_single_block(query, text_with_source)
-                
-                doc_with_score = doc.copy()
-                doc_with_score["relevance_score"] = ranking["relevance_score"]
-                # Calculate combined score - note that distance is inverted since lower is better
-                doc_with_score["combined_score"] = round(
-                    llm_weight * ranking["relevance_score"] + 
-                    vector_weight * doc['distance'],
-                    4
-                )
-                return doc_with_score
+        total_docs = len(documents)
+        print(f"[LLMReranker] Processing {total_docs} documents in {len(doc_batches)} batches with max {self.max_concurrent_requests} concurrent requests (QPS limit: {self.rate_limit_qps})")
 
-            # Process all documents in parallel using single-block method
-            # 使用受控的并发数量
-            with ThreadPoolExecutor(max_workers=self.max_concurrent_requests) as executor:
-                all_results = list(executor.map(process_single_doc, documents))
-                
+        progress_lock = Lock()
+
+        def rerank_single_doc(doc):
+            source_sha1 = doc.get('source_sha1', 'Unknown')
+            text_with_source = f"[来源: {source_sha1}]\n{doc['text']}"
+            doc_with_score = doc.copy()
+            try:
+                ranking = self.get_rank_for_single_block(query, text_with_source)
+                doc_with_score["relevance_score"] = ranking.get("relevance_score", 0.0)
+                doc_with_score["reasoning"] = ranking.get("reasoning", "No reasoning provided.")
+            except Exception as e:
+                print(f"[WARNING] Single block rerank failed: {e}")
+                self.increment_stat("batch_fallbacks")
+                self._record_failure(str(e))
+                doc_with_score["relevance_score"] = 0.0
+                doc_with_score["reasoning"] = f"Fallback due to error: {e}"
+            doc_with_score["combined_score"] = round(
+                doc_with_score.get("relevance_score", 0.0) * doc['distance'],
+                4
+            )
+            return doc_with_score
+
+        all_results = []
+
+        if documents_batch_size == 1:
+            if total_docs <= 1 or self.max_concurrent_requests <= 1:
+                all_results = [rerank_single_doc(doc) for doc in documents]
+            else:
+                with ThreadPoolExecutor(max_workers=self.max_concurrent_requests) as executor:
+                    all_results = list(executor.map(rerank_single_doc, documents))
         else:
             def process_batch(batch_idx_tuple):
-                """Process a batch and update progress"""
                 batch_idx, batch = batch_idx_tuple
-                
-                # 更新进度
                 if progress_callback:
-                    progress_percentage = 60 + int((batch_idx / len(doc_batches)) * 10)  # 60-70%
-                    progress_callback(f"🎯 重排序中 ({batch_idx + 1}/{len(doc_batches)} 批次)...", progress_percentage)
-                
-                # Add source information to texts for reranking context
+                    with progress_lock:
+                        progress_percentage = 60 + int((batch_idx / max(1, len(doc_batches))) * 10)
+                        progress_callback(f"🎯 重排序中 ({batch_idx + 1}/{len(doc_batches)} 批次)...", progress_percentage)
                 texts = [f"[来源: {doc.get('source_sha1', 'Unknown')}]\n{doc['text']}" for doc in batch]
                 try:
                     rankings = self.get_rank_for_multiple_blocks(query, texts)
                 except Exception as e:
-                    # 两次重试后依然失败，补全缺失项
-                    print("[DEBUG] ###########")
-                    print(f"         [Final] Warning: Expected {len(batch)} rankings but got less. Filling defaults.")
-                    rankings = {"block_rankings": []}
-                results = []
+                    print(f"[WARNING] Batch rerank failed, falling back to single-doc mode: {e}")
+                    self.increment_stat("batch_fallbacks")
+                    self._record_failure(str(e))
+                    return [rerank_single_doc(doc) for doc in batch]
+
                 block_rankings = rankings.get('block_rankings', [])
-                if len(block_rankings) < len(batch):
-                    for _ in range(len(batch) - len(block_rankings)):
-                        block_rankings.append({
-                            "relevance_score": 0.0,
-                            "reasoning": "Default ranking due to missing LLM response"
-                        })
+                if len(block_rankings) != len(batch):
+                    missing = abs(len(batch) - len(block_rankings))
+                    print(f"[WARNING] Batch ranking mismatch: expected {len(batch)}, got {len(block_rankings)}")
+                    self.increment_stat("missing_rankings", missing)
+                    self.increment_stat("batch_fallbacks")
+                    return [rerank_single_doc(doc) for doc in batch]
+
+                results = []
                 for doc, rank in zip(batch, block_rankings):
                     doc_with_score = doc.copy()
-                    # 健壮性处理，缺失字段补默认值
                     doc_with_score["relevance_score"] = rank.get("relevance_score", 0.0)
                     doc_with_score["reasoning"] = rank.get("reasoning", "No reasoning provided.")
                     doc_with_score["combined_score"] = round(
-                        llm_weight * doc_with_score["relevance_score"] + 
-                        vector_weight * doc['distance'],
+                        doc_with_score["relevance_score"] * doc['distance'],
                         4
                     )
                     results.append(doc_with_score)
                 return results
 
-            # Process batches in parallel with controlled concurrency
-            # 使用受控的并发数量：max_workers 限制同时运行的线程数
-            with ThreadPoolExecutor(max_workers=self.max_concurrent_requests) as executor:
-                # 为每个 batch 添加索引以便追踪进度
-                batch_results = list(executor.map(process_batch, enumerate(doc_batches)))
-            
-            # Flatten results
-            all_results = []
+            if len(doc_batches) == 1 or self.max_concurrent_requests <= 1:
+                batch_results = [process_batch(item) for item in enumerate(doc_batches)]
+            else:
+                with ThreadPoolExecutor(max_workers=self.max_concurrent_requests) as executor:
+                    batch_results = list(executor.map(process_batch, enumerate(doc_batches)))
             for batch in batch_results:
                 all_results.extend(batch)
-        
-        # Sort results by combined score in descending order
+
         all_results.sort(key=lambda x: x["combined_score"], reverse=True)
         return all_results
