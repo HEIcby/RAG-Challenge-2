@@ -300,9 +300,9 @@ class LLMReranker:
         vector_weight = 1 - llm_weight
         total_docs = len(documents)
         print(f"[LLMReranker] Processing {total_docs} documents in {len(doc_batches)} batches with max {self.max_concurrent_requests} concurrent requests (QPS limit: {self.rate_limit_qps})")
-
+        
         progress_lock = Lock()
-
+        
         def rerank_single_doc(doc):
             source_sha1 = doc.get('source_sha1', 'Unknown')
             text_with_source = f"[来源: {source_sha1}]\n{doc['text']}"
@@ -337,7 +337,7 @@ class LLMReranker:
                 if progress_callback:
                     with progress_lock:
                         progress_percentage = 60 + int((batch_idx / max(1, len(doc_batches))) * 10)
-                        progress_callback(f"🎯 重排序中 ({batch_idx + 1}/{len(doc_batches)} 批次)...", progress_percentage)
+                    progress_callback(f"🎯 重排序中 ({batch_idx + 1}/{len(doc_batches)} 批次)...", progress_percentage)
                 texts = [f"[来源: {doc.get('source_sha1', 'Unknown')}]\n{doc['text']}" for doc in batch]
                 try:
                     rankings = self.get_rank_for_multiple_blocks(query, texts)
@@ -374,6 +374,6 @@ class LLMReranker:
                     batch_results = list(executor.map(process_batch, enumerate(doc_batches)))
             for batch in batch_results:
                 all_results.extend(batch)
-
+        
         all_results.sort(key=lambda x: x["combined_score"], reverse=True)
         return all_results

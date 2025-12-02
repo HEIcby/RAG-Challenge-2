@@ -785,7 +785,7 @@ class VectorRetriever:
 
         if not query_embeddings:
             raise ValueError("Failed to generate embeddings for all queries.")
-
+        
         # 命中结果存储（用字典聚合）
         # key = (sha1, page_id or chunk_id), value = dict with distances, count, text
         aggregated_results = {}

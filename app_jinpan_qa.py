@@ -354,8 +354,8 @@ def format_answer_display(answer_dict: dict, question: str = ""):
     standard_answer = ""
     if question:
         try:
-            questions_df = pd.read_csv("data/val_set/questions.csv")
-            benchmark_map = load_benchmark_answers("金盘财报查询场景问题benchmark-工作表1.csv")
+            questions_df = pd.read_csv("data/val_set/questions_selected_100.csv")
+            benchmark_map = load_benchmark_answers("金盘财报查询场景问题benchmark-原先的表格.csv")
             standard_answer = get_standard_answer(question, questions_df, benchmark_map)
         except Exception as e:
             st.warning(f"获取标准答案失败: {e}")
@@ -372,7 +372,7 @@ def format_answer_display(answer_dict: dict, question: str = ""):
     with col1:
         st.markdown("**🤖 RAG生成的答案**")
         st.markdown(f'<div class="answer-box"><h3 style="color: #0d6efd; margin-top: 0; margin-bottom: 0;">💡 {answer}</h3></div>', 
-                    unsafe_allow_html=True)
+                unsafe_allow_html=True)
     
     with col2:
         st.markdown("**✅ 标准答案**")
@@ -1126,13 +1126,13 @@ with st.sidebar:
             model_options = ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo']
         else:
             model_options = ['gemini-1.5-pro', 'gemini-1.5-flash']
-        
-        answering_model = st.selectbox(
-            "回答模型",
-            options=model_options,
+    
+    answering_model = st.selectbox(
+        "回答模型",
+        options=model_options,
             index=model_options.index(answering_model) if answering_model in model_options else 0,
-            help="用于生成答案的模型"
-        )
+        help="用于生成答案的模型"
+    )
     
     with st.expander("⚙️ 基础检索", expanded=(selected_step == "retrieval")):
         top_n_retrieval = st.slider(
@@ -1278,29 +1278,29 @@ with st.sidebar:
                 st.session_state.selected_years = None
         else:
             st.info("ℹ️ 系统尚未初始化，暂无法读取年份信息")
-            st.session_state.selected_years = None
-        
-        enable_multi_turn = st.checkbox(
-            "启用多轮对话",
+        st.session_state.selected_years = None
+    
+    enable_multi_turn = st.checkbox(
+        "启用多轮对话",
             value=st.session_state.enable_multi_turn,
             help="启用后记住上下文，可能增加token消耗",
-            key="multi_turn_checkbox"
+        key="multi_turn_checkbox"
+    )
+    st.session_state.enable_multi_turn = enable_multi_turn
+    if enable_multi_turn:
+        context_turns = st.slider(
+            "保留对话轮数",
+            min_value=1,
+            max_value=10,
+            value=st.session_state.context_turns,
+            step=1,
+            help="设置保留多少轮历史对话作为上下文",
+            key="context_turns_slider"
         )
-        st.session_state.enable_multi_turn = enable_multi_turn
-        if enable_multi_turn:
-            context_turns = st.slider(
-                "保留对话轮数",
-                min_value=1,
-                max_value=10,
-                value=st.session_state.context_turns,
-                step=1,
-                help="设置保留多少轮历史对话作为上下文",
-                key="context_turns_slider"
-            )
-            st.session_state.context_turns = context_turns
-            st.info(f"💡 当前保留最近 **{context_turns}** 轮对话作为上下文")
-        else:
-            st.warning("⚠️ 多轮对话已关闭，每次问答相互独立")
+        st.session_state.context_turns = context_turns
+        st.info(f"💡 当前保留最近 **{context_turns}** 轮对话作为上下文")
+    else:
+        st.warning("⚠️ 多轮对话已关闭，每次问答相互独立")
     
     # 检测配置变化
     new_config = {
@@ -1369,6 +1369,131 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 📊 批量评估")
     
+    # 批量评估配置
+    with st.expander("⚙️ 评估配置（可选）", expanded=False):
+        st.markdown("#### 🔧 评估时使用的配置")
+        st.info("💡 如果不修改，将使用上方流程配置中的当前设置")
+        
+        eval_col1, eval_col2 = st.columns(2)
+        
+        with eval_col1:
+            st.markdown("##### 🚀 检索增强")
+            eval_use_hyde = st.checkbox(
+                "启用 HYDE",
+                value=config_defaults.get('use_hyde', True),
+                help="生成假设性答案辅助检索",
+                key="eval_use_hyde"
+            )
+            eval_use_multi_query = st.checkbox(
+                "启用 Multi-Query",
+                value=config_defaults.get('use_multi_query', True),
+                help="生成多个相关查询并行检索",
+                key="eval_use_multi_query"
+            )
+            
+            if eval_use_multi_query:
+                st.markdown("**Multi-Query 方法：**")
+                eval_mq_synonym = st.checkbox(
+                    "名词解释",
+                    value=config_defaults.get('multi_query_methods', {}).get('synonym', True),
+                    help="为财务名词补充定义、近义词、计算方法",
+                    key="eval_mq_synonym"
+                )
+                eval_mq_subquestion = st.checkbox(
+                    "指标拆分",
+                    value=config_defaults.get('multi_query_methods', {}).get('subquestion', False),
+                    help="按指标/时间拆分子问题",
+                    key="eval_mq_subquestion"
+                )
+                eval_mq_variant = st.checkbox(
+                    "情景变体",
+                    value=config_defaults.get('multi_query_methods', {}).get('variant', False),
+                    help="生成不同角度的提问",
+                    key="eval_mq_variant"
+                )
+        
+        with eval_col2:
+            st.markdown("##### 🎯 重排序与扩充")
+            eval_llm_reranking = st.checkbox(
+                "启用 LLM 重排序",
+                value=config_defaults.get('llm_reranking', True),
+                help="使用LLM对检索结果进行智能重排序",
+                key="eval_llm_reranking"
+            )
+            
+            if eval_llm_reranking:
+                eval_rerank_sample_size = st.number_input(
+                    "重排序样本数",
+                    min_value=10,
+                    max_value=100,
+                    value=config_defaults.get('rerank_sample_size', 20),
+                    step=10,
+                    help="LLM重排序时处理的样本数量",
+                    key="eval_rerank_sample_size"
+                )
+            else:
+                eval_rerank_sample_size = 20
+            
+            eval_expand_upstream = st.checkbox(
+                "启用上下游扩充",
+                value=config_defaults.get('expand_upstream', True),
+                help="扩充检索结果的上下文页面",
+                key="eval_expand_upstream"
+            )
+            
+            if eval_expand_upstream:
+                eval_expand_top_k = st.number_input(
+                    "扩充 top-k",
+                    min_value=1,
+                    max_value=20,
+                    value=config_defaults.get('expand_top_k', 5),
+                    step=1,
+                    help="对前k个检索结果进行上下游扩充",
+                    key="eval_expand_top_k"
+                )
+                eval_expand_context_size = st.number_input(
+                    "扩充大小",
+                    min_value=1,
+                    max_value=5,
+                    value=config_defaults.get('expand_context_size', 1),
+                    step=1,
+                    help="向上和向下各扩充的页面数",
+                    key="eval_expand_context_size"
+                )
+            else:
+                eval_expand_top_k = 5
+                eval_expand_context_size = 1
+            
+            st.markdown("##### 📊 检索参数")
+            eval_top_n = st.number_input(
+                "最终检索数量",
+                min_value=5,
+                max_value=50,
+                value=config_defaults.get('top_n_retrieval', 10),
+                step=5,
+                help="最终返回的检索结果数量",
+                key="eval_top_n"
+            )
+        
+        # 应用评估配置按钮
+        if st.button("✅ 应用此配置到评估", use_container_width=True):
+            st.session_state.eval_config = {
+                'use_hyde': eval_use_hyde,
+                'use_multi_query': eval_use_multi_query,
+                'multi_query_methods': {
+                    'synonym': eval_mq_synonym if eval_use_multi_query else False,
+                    'subquestion': eval_mq_subquestion if eval_use_multi_query else False,
+                    'variant': eval_mq_variant if eval_use_multi_query else False
+                },
+                'llm_reranking': eval_llm_reranking,
+                'rerank_sample_size': eval_rerank_sample_size,
+                'expand_upstream': eval_expand_upstream,
+                'expand_top_k': eval_expand_top_k,
+                'expand_context_size': eval_expand_context_size,
+                'top_n_retrieval': eval_top_n
+            }
+            st.success("✅ 评估配置已应用！点击下方按钮开始评估")
+    
     if st.button("🚀 一键评估所有问题", use_container_width=True, type="primary"):
         st.session_state.evaluating = True
         st.rerun()
@@ -1379,7 +1504,7 @@ with st.sidebar:
         max_value=16,
         value=config_defaults.get('parallel_requests', 4),
         step=1,
-        help="设置“一键评估”运行时使用的并行线程数（数值越大速度越快，但占用资源更多）",
+        help="设置一键评估运行时使用的并行线程数（数值越大速度越快，但占用资源更多）",
         key="parallel_requests_slider"
     )
     st.session_state.config['parallel_requests'] = parallel_requests
@@ -1401,262 +1526,431 @@ with st.sidebar:
     - `names`: 多个名称列表
     """)
 
+# ==================== 评估结果可视化辅助函数 ====================
+@st.cache_data
+def load_evaluation_results(val_result_dir: str = "data/val_set/val_result"):
+    """加载所有评估结果文件"""
+    result_dir = Path(val_result_dir)
+    if not result_dir.exists():
+        return []
+    
+    results = []
+    for json_file in sorted(result_dir.glob("evaluation_*.json"), reverse=True):
+        try:
+            with open(json_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                data['file_name'] = json_file.name
+                data['file_path'] = str(json_file)
+                results.append(data)
+        except Exception as e:
+            st.warning(f"加载评估文件失败 {json_file.name}: {e}")
+    
+    return results
+
+def format_config_summary(config: dict) -> str:
+    """格式化配置摘要"""
+    parts = []
+    if config.get('use_hyde'):
+        parts.append("HYDE")
+    if config.get('use_multi_query'):
+        mq_methods = []
+        if config.get('multi_query_methods', {}).get('synonym'):
+            mq_methods.append("名词解释")
+        if config.get('multi_query_methods', {}).get('subquestion'):
+            mq_methods.append("指标拆分")
+        if config.get('multi_query_methods', {}).get('variant'):
+            mq_methods.append("情景变体")
+        if mq_methods:
+            parts.append(f"Multi-Query({','.join(mq_methods)})")
+    if config.get('llm_reranking'):
+        parts.append(f"LLM重排序(样本{config.get('rerank_sample_size', 20)})")
+    if config.get('expand_upstream'):
+        parts.append(f"上游扩充(k={config.get('expand_top_k', 5)},±{config.get('expand_context_size', 1)})")
+    return " | ".join(parts) if parts else "基础配置"
+
+def find_question_across_results(question: str, evaluation_results: List[dict]) -> List[dict]:
+    """在所有评估结果中查找某个问题的答案"""
+    matches = []
+    for eval_data in evaluation_results:
+        for result in eval_data.get('results', []):
+            if result.get('question', '').strip() == question.strip():
+                matches.append({
+                    'config': eval_data.get('config', {}),
+                    'config_summary': format_config_summary(eval_data.get('config', {})),
+                    'timestamp': eval_data.get('timestamp', ''),
+                    'file_name': eval_data.get('file_name', ''),
+                    'rag_answer': result.get('rag_answer', ''),
+                    'standard_answer': result.get('standard_answer', ''),
+                    'score': result.get('score', 0.0),
+                    'reasoning': result.get('reasoning', ''),
+                    'is_correct': result.get('is_correct', False)
+                })
+    return matches
+
 # ==================== 主界面 ====================
-st.title("🏢 金盘科技 RAG 问答系统")
-st.markdown("基于 **FAISS + Qwen + 时间路由** 的智能财务问答系统")
+# 主功能选择
+main_tab1, main_tab2 = st.tabs(["💬 问答系统", "📊 评估结果分析"])
 
-# 初始化系统
-if not st.session_state.initialized:
-    if initialize_system():
-        st.success("✅ 系统初始化成功！")
-        st.rerun()
-    else:
-        st.stop()
-
-# 批量评估功能
-if st.session_state.get('evaluating', False):
-    st.session_state.evaluating = False
+with main_tab1:
+    st.title("🏢 金盘科技 RAG 问答系统")
+    st.markdown("基于 **FAISS + Qwen + 时间路由** 的智能财务问答系统")
     
-    st.markdown("---")
-    st.markdown("## 📊 批量评估进行中...")
+    # 初始化系统
+    if not st.session_state.initialized:
+        if initialize_system():
+            st.success("✅ 系统初始化成功！")
+            st.rerun()
+        else:
+            st.stop()
     
-    try:
-        # 加载问题
-        questions_df = pd.read_csv("data/val_set/questions.csv")
-        benchmark_map = load_benchmark_answers("金盘财报查询场景问题benchmark-工作表1.csv")
+    # 批量评估功能
+    if st.session_state.get('evaluating', False):
+        st.session_state.evaluating = False
         
-        # 创建评估结果目录
-        val_result_dir = Path("data/val_set/val_result")
-        val_result_dir.mkdir(parents=True, exist_ok=True)
+        st.markdown("---")
+        st.markdown("## 📊 批量评估进行中...")
         
-        # 初始化评估结果
-        evaluation_results = []
-        total_questions = len(questions_df)
-        correct_count = 0
-        total_score = 0.0
-        
-        # 收集各阶段时间
-        timing_accumulator = {
-            'init_retriever': [],
-            'retrieval': [],
-            'hyde_expansion': [],
-            'multi_query_expansion': [],
-            'llm_reranking': [],
-            'upstream_expansion': [],
-            'format_results': [],
-            'generate_answer': [],
-            'vector_search': [],
-            'total_time': []
-        }
-        
-        # 创建进度条
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        results_container = st.container()
-        
-        # 初始化API处理器
-        api_processor = APIProcessor(provider="qwen")
-        company_name = st.session_state.company_name
-        config = st.session_state.config
-        
-        # 获取配置信息
-        config_info = {
-            'top_n_retrieval': config.get('top_n_retrieval', 10),
-            'use_hyde': config.get('use_hyde', True),
-            'use_multi_query': config.get('use_multi_query', True),
-            'llm_reranking': config.get('llm_reranking', True),
-            'rerank_sample_size': config.get('llm_reranking_sample_size', 20),
-            'expand_upstream': config.get('expand_upstream', False),
-            'expand_top_k': config.get('expand_top_k', 5),
-            'expand_context_size': config.get('expand_context_size', 2),
-            'answering_model': config.get('answering_model', 'qwen-max'),
-            'api_provider': config.get('api_provider', 'qwen')
-        }
-        
-        # 遍历所有问题
-        for idx, row in questions_df.iterrows():
-            question = str(row.get('提问内容', '')).strip()
-            if not question:
-                continue
+        try:
+            # 加载问题
+            questions_df = pd.read_csv("data/val_set/questions_selected_100.csv")
+            benchmark_map = load_benchmark_answers("金盘财报查询场景问题benchmark-原先的表格.csv")
             
-            # 更新进度
-            progress = (idx + 1) / total_questions
-            status_text.text(f"正在评估第 {idx + 1}/{total_questions} 个问题: {question[:50]}...")
-            progress_bar.progress(progress)
+            # 创建评估结果目录
+            val_result_dir = Path("data/val_set/val_result")
+            val_result_dir.mkdir(parents=True, exist_ok=True)
             
-            # 获取标准答案
-            standard_answer = get_standard_answer(question, questions_df, benchmark_map)
-            if not standard_answer:
-                # 如果没有标准答案，跳过
-                evaluation_results.append({
-                    'question': question,
-                    'standard_answer': '',
-                    'rag_answer': '',
-                    'score': 0.0,
-                    'reasoning': '无标准答案，跳过评估',
-                    'is_correct': False,
-                    'skipped': True,
-                    'timing': {}
-                })
-                continue
+            # 初始化评估结果
+            evaluation_results = []
+            total_questions = len(questions_df)
+            correct_count = 0
+            total_score = 0.0
             
-            try:
-                # 调用RAG系统获取答案
-                full_question = f"{company_name}{question}" if company_name not in question else question
-                answer_dict = st.session_state.processor.get_answer_for_company(
-                    company_name=company_name,
-                    question=full_question,
-                    schema="jingpan",
-                    conversation_history=None,
-                    progress_callback=None,
-                    selected_years=None
-                )
-                
-                rag_answer = str(answer_dict.get("final_answer", answer_dict.get("answer", "N/A")))
-                
-                # 提取时间信息
-                timing = answer_dict.get('timing', {})
-                if timing:
-                    for key in timing_accumulator:
-                        if key in timing:
-                            timing_accumulator[key].append(timing[key])
-                
-                # 使用LLM as Judge评估
-                eval_result = api_processor.evaluate_answer(
-                    question=question,
-                    standard_answer=standard_answer,
-                    rag_answer=rag_answer,
-                    model="qwen-turbo"
-                )
-                
-                score = eval_result.get('score', 0.0)
-                total_score += score
-                is_correct = score >= 0.8
-                if is_correct:
-                    correct_count += 1
-                
-                evaluation_results.append({
-                    'question': question,
-                    'standard_answer': standard_answer,
-                    'rag_answer': rag_answer,
-                    'score': score,
-                    'reasoning': eval_result.get('reasoning', ''),
-                    'is_correct': is_correct,
-                    'skipped': False,
-                    'timing': timing
-                })
-                
-            except Exception as e:
-                evaluation_results.append({
-                    'question': question,
-                    'standard_answer': standard_answer,
-                    'rag_answer': '',
-                    'score': 0.0,
-                    'reasoning': f'评估失败: {str(e)}',
-                    'is_correct': False,
-                    'skipped': False,
-                    'error': str(e),
-                    'timing': {}
-                })
-        
-        # 完成评估
-        progress_bar.progress(1.0)
-        status_text.text("✅ 评估完成！")
-        
-        # 统计结果
-        evaluated_count = len([r for r in evaluation_results if not r.get('skipped', False)])
-        accuracy = correct_count / evaluated_count if evaluated_count > 0 else 0.0
-        average_score = total_score / evaluated_count if evaluated_count > 0 else 0.0
-        
-        # 计算各阶段平均用时（精确到秒）
-        avg_timing = {}
-        for key, times in timing_accumulator.items():
-            if times:
-                avg_time = sum(times) / len(times)
-                avg_timing[key] = round(avg_time, 2)  # 保留2位小数（精确到0.01秒）
-            else:
-                avg_timing[key] = 0.0
-        
-        # 获取最终检索数量（从配置中）
-        final_retrieval_count = config_info['top_n_retrieval']
-        if config_info.get('expand_upstream', False):
-            # 如果有上游扩充，检索数量会更多
-            final_retrieval_count = f"{config_info['top_n_retrieval']} + 扩充"
-        
-        # 保存结果
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        result_file = val_result_dir / f"evaluation_{timestamp}.json"
-        
-        result_data = {
-            'timestamp': timestamp,
-            'total_questions': total_questions,
-            'evaluated_count': evaluated_count,
-            'correct_count': correct_count,
-            'accuracy': accuracy,
-            'average_score': average_score,
-            'config': config_info,
-            'final_retrieval_count': final_retrieval_count,
-            'average_timing': avg_timing,
-            'results': evaluation_results
-        }
-        
-        with open(result_file, 'w', encoding='utf-8') as f:
-            json.dump(result_data, f, ensure_ascii=False, indent=2)
-        
-        # 显示统计结果
-        with results_container:
-            st.success(f"✅ 评估完成！结果已保存到: {result_file}")
+            # 收集各阶段时间
+            timing_accumulator = {
+                'init_retriever': [],
+                'retrieval': [],
+                'hyde_expansion': [],
+                'multi_query_expansion': [],
+                'llm_reranking': [],
+                'upstream_expansion': [],
+                'format_results': [],
+                'generate_answer': [],
+                'vector_search': [],
+                'total_time': []
+            }
             
-            col1, col2, col3, col4, col5 = st.columns(5)
-            with col1:
-                st.metric("总问题数", total_questions)
-            with col2:
-                st.metric("已评估", evaluated_count)
-            with col3:
-                st.metric("正确答案", correct_count)
-            with col4:
-                st.metric("正确率", f"{accuracy*100:.2f}%")
-            with col5:
-                st.metric("平均得分", f"{average_score:.3f}")
+            # 创建进度条
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            results_container = st.container()
             
-            # 显示各阶段平均用时
-            st.markdown("### ⏱️ 各阶段平均用时（秒）")
-            timing_df = pd.DataFrame([
-                {'阶段': '初始化检索器', '平均用时(秒)': avg_timing.get('init_retriever', 0.0)},
-                {'阶段': '向量检索', '平均用时(秒)': avg_timing.get('retrieval', 0.0)},
-                {'阶段': 'HYDE扩展', '平均用时(秒)': avg_timing.get('hyde_expansion', 0.0)},
-                {'阶段': 'Multi-Query扩展', '平均用时(秒)': avg_timing.get('multi_query_expansion', 0.0)},
-                {'阶段': '向量搜索', '平均用时(秒)': avg_timing.get('vector_search', 0.0)},
-                {'阶段': 'LLM重排序', '平均用时(秒)': avg_timing.get('llm_reranking', 0.0)},
-                {'阶段': '上游扩充', '平均用时(秒)': avg_timing.get('upstream_expansion', 0.0)},
-                {'阶段': '格式化结果', '平均用时(秒)': avg_timing.get('format_results', 0.0)},
-                {'阶段': '生成答案', '平均用时(秒)': avg_timing.get('generate_answer', 0.0)},
-                {'阶段': '总用时', '平均用时(秒)': avg_timing.get('total_time', 0.0)},
-            ])
-            st.dataframe(timing_df, use_container_width=True, hide_index=True)
+            # 初始化API处理器
+            api_processor = APIProcessor(provider="qwen")
+            company_name = st.session_state.company_name
+            config = st.session_state.config
             
-            # 显示详细结果表格
-            st.markdown("### 📋 详细评估结果")
-            results_df = pd.DataFrame([
-                {
-                    '问题': r['question'][:50] + '...' if len(r['question']) > 50 else r['question'],
-                    '标准答案': r['standard_answer'][:50] + '...' if len(r.get('standard_answer', '')) > 50 else r.get('standard_answer', ''),
-                    'RAG答案': r['rag_answer'][:50] + '...' if len(r.get('rag_answer', '')) > 50 else r.get('rag_answer', ''),
-                    '评分': r['score'],
-                    '是否正确': '✅' if r['is_correct'] else '❌',
-                    '状态': '跳过' if r.get('skipped', False) else '已评估'
+            # 检查是否有专门的评估配置
+            eval_config = st.session_state.get('eval_config', None)
+            if eval_config:
+                st.info(f"📋 使用自定义评估配置: HYDE={eval_config['use_hyde']}, Multi-Query={eval_config['use_multi_query']}, LLM重排序={eval_config['llm_reranking']}")
+                # 使用评估配置
+                config_info = {
+                    'top_n_retrieval': eval_config.get('top_n_retrieval', 10),
+                    'use_hyde': eval_config.get('use_hyde', True),
+                    'use_multi_query': eval_config.get('use_multi_query', True),
+                    'multi_query_methods': eval_config.get('multi_query_methods', {'synonym': True, 'subquestion': False, 'variant': False}),
+                    'llm_reranking': eval_config.get('llm_reranking', True),
+                    'rerank_sample_size': eval_config.get('rerank_sample_size', 20),
+                    'expand_upstream': eval_config.get('expand_upstream', False),
+                    'expand_top_k': eval_config.get('expand_top_k', 5),
+                    'expand_context_size': eval_config.get('expand_context_size', 1),
+                    'parent_document_retrieval': True,
+                    'parallel_requests': config.get('parallel_requests', 4),
+                    'answering_model': config.get('answering_model', 'qwen-max'),
+                    'api_provider': config.get('api_provider', 'qwen')
                 }
-                for r in evaluation_results
-            ])
-            st.dataframe(results_df, use_container_width=True)
+                # 临时更新processor的配置
+                st.session_state.processor.use_hyde = eval_config['use_hyde']
+                st.session_state.processor.use_multi_query = eval_config['use_multi_query']
+                st.session_state.processor.multi_query_methods = eval_config['multi_query_methods']
+                st.session_state.processor.llm_reranking = eval_config['llm_reranking']
+                st.session_state.processor.llm_reranking_sample_size = eval_config['rerank_sample_size']
+                st.session_state.processor.expand_upstream = eval_config['expand_upstream']
+                st.session_state.processor.expand_top_k = eval_config['expand_top_k']
+                st.session_state.processor.expand_context_size = eval_config['expand_context_size']
+                st.session_state.processor.top_n_retrieval = eval_config['top_n_retrieval']
+            else:
+                st.info("📋 使用当前流程配置进行评估")
+                # 使用当前配置
+                config_info = {
+                    'top_n_retrieval': config.get('top_n_retrieval', 10),
+                    'use_hyde': config.get('use_hyde', True),
+                    'use_multi_query': config.get('use_multi_query', True),
+                    'multi_query_methods': config.get('multi_query_methods', {'synonym': True, 'subquestion': False, 'variant': False}),
+                    'llm_reranking': config.get('llm_reranking', True),
+                    'rerank_sample_size': config.get('llm_reranking_sample_size', 20),
+                    'expand_upstream': config.get('expand_upstream', False),
+                    'expand_top_k': config.get('expand_top_k', 5),
+                    'expand_context_size': config.get('expand_context_size', 2),
+                    'parent_document_retrieval': True,  # 默认启用父文档检索
+                    'parallel_requests': config.get('parallel_requests', 4),
+                    'answering_model': config.get('answering_model', 'qwen-max'),
+                    'api_provider': config.get('api_provider', 'qwen')
+                }
+            
+            # 显示超参数确认对话框
+            st.markdown("---")
+            st.markdown("### 📋 超参数配置确认")
+            
+            # 创建两列显示配置
+            conf_col1, conf_col2 = st.columns(2)
+            
+            with conf_col1:
+                st.markdown("#### 🚀 检索增强配置")
+                st.markdown(f"- **HYDE**: {'✅ 启用' if config_info['use_hyde'] else '❌ 关闭'}")
+                st.markdown(f"- **Multi-Query**: {'✅ 启用' if config_info['use_multi_query'] else '❌ 关闭'}")
+                if config_info['use_multi_query']:
+                    mq_methods = config_info['multi_query_methods']
+                    st.markdown(f"  - 名词解释: {'✅' if mq_methods.get('synonym', False) else '❌'}")
+                    st.markdown(f"  - 指标拆分: {'✅' if mq_methods.get('subquestion', False) else '❌'}")
+                    st.markdown(f"  - 情景变体: {'✅' if mq_methods.get('variant', False) else '❌'}")
+                
+                st.markdown("#### 🎯 重排序配置")
+                st.markdown(f"- **LLM重排序**: {'✅ 启用' if config_info['llm_reranking'] else '❌ 关闭'}")
+                if config_info['llm_reranking']:
+                    st.markdown(f"  - 样本数: {config_info['rerank_sample_size']}")
+            
+            with conf_col2:
+                st.markdown("#### 📊 检索参数")
+                st.markdown(f"- **最终检索数量**: {config_info['top_n_retrieval']}")
+                st.markdown(f"- **父文档检索**: {'✅ 启用' if config_info['parent_document_retrieval'] else '❌ 关闭'}")
+                
+                st.markdown("#### 🔄 上下游扩充")
+                st.markdown(f"- **上下游扩充**: {'✅ 启用' if config_info['expand_upstream'] else '❌ 关闭'}")
+                if config_info['expand_upstream']:
+                    st.markdown(f"  - 扩充 top-k: {config_info['expand_top_k']}")
+                    st.markdown(f"  - 扩充大小: ±{config_info['expand_context_size']} 页")
+                
+                st.markdown("#### 🤖 模型配置")
+                st.markdown(f"- **回答模型**: {config_info['answering_model']}")
+                st.markdown(f"- **并发数**: {config_info['parallel_requests']}")
+            
+            st.markdown("---")
+            st.warning("⚠️ 评估将使用上述配置运行，预计耗时较长。请确认配置无误后继续。")
+            
+            # 遍历所有问题
+            for idx, row in questions_df.iterrows():
+                question = str(row.get('提问内容', '')).strip()
+                if not question:
+                    continue
+                
+                # 更新进度
+                progress = (idx + 1) / total_questions
+                status_text.text(f"正在评估第 {idx + 1}/{total_questions} 个问题: {question[:50]}...")
+                progress_bar.progress(progress)
+                
+                # 获取标准答案
+                standard_answer = get_standard_answer(question, questions_df, benchmark_map)
+                if not standard_answer:
+                    # 如果没有标准答案，跳过
+                    evaluation_results.append({
+                        'question': question,
+                        'standard_answer': '',
+                        'rag_answer': '',
+                        'score': 0.0,
+                        'reasoning': '无标准答案，跳过评估',
+                        'is_correct': False,
+                        'skipped': True,
+                        'timing': {}
+                    })
+                    continue
+                
+                try:
+                    # 调用RAG系统获取答案
+                    full_question = f"{company_name}{question}" if company_name not in question else question
+                    answer_dict = st.session_state.processor.get_answer_for_company(
+                        company_name=company_name,
+                        question=full_question,
+                        schema="jingpan",
+                        conversation_history=None,
+                        progress_callback=None,
+                        selected_years=None
+                    )
+                    
+                    rag_answer = str(answer_dict.get("final_answer", answer_dict.get("answer", "N/A")))
+                    
+                    # 提取时间信息
+                    timing = answer_dict.get('timing', {})
+                    if timing:
+                        for key in timing_accumulator:
+                            if key in timing:
+                                timing_accumulator[key].append(timing[key])
+                    
+                    # 使用LLM as Judge评估
+                    try:
+                        eval_result = api_processor.evaluate_answer(
+                            question=question,
+                            standard_answer=standard_answer,
+                            rag_answer=rag_answer,
+                            model="qwen-turbo"
+                        )
+                        
+                        # 验证评估结果的有效性
+                        if not eval_result or not isinstance(eval_result, dict):
+                            raise ValueError("评估结果为空或格式错误")
+                        
+                        score = eval_result.get('score', 0.0)
+                        reasoning = eval_result.get('reasoning', '')
+                        
+                        # 验证reasoning不为空
+                        if not reasoning or not reasoning.strip():
+                            raise ValueError(f"评估返回的reasoning为空，score={score}")
+                        
+                        total_score += score
+                        is_correct = score >= 0.8
+                        if is_correct:
+                            correct_count += 1
+                        
+                        evaluation_results.append({
+                            'question': question,
+                            'standard_answer': standard_answer,
+                            'rag_answer': rag_answer,
+                            'score': score,
+                            'reasoning': reasoning,
+                            'is_correct': is_correct,
+                            'skipped': False,
+                            'timing': timing
+                        })
+                        
+                    except Exception as eval_error:
+                        # 评估失败时的降级处理
+                        error_msg = str(eval_error)
+                        print(f"[WARNING] 评估失败 (问题: {question[:50]}...): {error_msg}")
+                        st.warning(f"⚠️ 问题评估失败: {error_msg}")
+                        
+                        # 使用默认值，但保留RAG答案和时间信息
+                        evaluation_results.append({
+                            'question': question,
+                            'standard_answer': standard_answer,
+                            'rag_answer': rag_answer,  # 保留RAG答案
+                            'score': 0.0,
+                            'reasoning': f'评估失败: {error_msg}',
+                            'is_correct': False,
+                            'skipped': False,
+                            'timing': timing  # 保留时间信息
+                        })
+                    
+                except Exception as e:
+                    evaluation_results.append({
+                        'question': question,
+                        'standard_answer': standard_answer,
+                        'rag_answer': '',
+                        'score': 0.0,
+                        'reasoning': f'评估失败: {str(e)}',
+                        'is_correct': False,
+                        'skipped': False,
+                        'error': str(e),
+                        'timing': {}
+                    })
+            
+            # 完成评估
+            progress_bar.progress(1.0)
+            status_text.text("✅ 评估完成！")
+            
+            # 统计结果
+            evaluated_count = len([r for r in evaluation_results if not r.get('skipped', False)])
+            accuracy = correct_count / evaluated_count if evaluated_count > 0 else 0.0
+            average_score = total_score / evaluated_count if evaluated_count > 0 else 0.0
+            
+            # 计算各阶段平均用时（精确到秒）
+            avg_timing = {}
+            for key, times in timing_accumulator.items():
+                if times:
+                    avg_time = sum(times) / len(times)
+                    avg_timing[key] = round(avg_time, 2)  # 保留2位小数（精确到0.01秒）
+                else:
+                    avg_timing[key] = 0.0
+            
+            # 获取最终检索数量（从配置中）
+            final_retrieval_count = config_info['top_n_retrieval']
+            if config_info.get('expand_upstream', False):
+                # 如果有上游扩充，检索数量会更多
+                final_retrieval_count = f"{config_info['top_n_retrieval']} + 扩充"
+            
+            # 保存结果
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            result_file = val_result_dir / f"evaluation_{timestamp}.json"
+            
+            result_data = {
+                'timestamp': timestamp,
+                'total_questions': total_questions,
+                'evaluated_count': evaluated_count,
+                'correct_count': correct_count,
+                'accuracy': accuracy,
+                'average_score': average_score,
+                'config': config_info,
+                'final_retrieval_count': final_retrieval_count,
+                'average_timing': avg_timing,
+                'results': evaluation_results
+            }
+            
+            with open(result_file, 'w', encoding='utf-8') as f:
+                json.dump(result_data, f, ensure_ascii=False, indent=2)
+            
+            # 显示统计结果
+            with results_container:
+                st.success(f"✅ 评估完成！结果已保存到: {result_file}")
+                
+                col1, col2, col3, col4, col5 = st.columns(5)
+                with col1:
+                    st.metric("总问题数", total_questions)
+                with col2:
+                    st.metric("已评估", evaluated_count)
+                with col3:
+                    st.metric("正确答案", correct_count)
+                with col4:
+                    st.metric("正确率", f"{accuracy*100:.2f}%")
+                with col5:
+                    st.metric("平均得分", f"{average_score:.3f}")
+                
+                # 显示各阶段平均用时
+                st.markdown("### ⏱️ 各阶段平均用时（秒）")
+                timing_df = pd.DataFrame([
+                    {'阶段': '初始化检索器', '平均用时(秒)': avg_timing.get('init_retriever', 0.0)},
+                    {'阶段': '向量检索', '平均用时(秒)': avg_timing.get('retrieval', 0.0)},
+                    {'阶段': 'HYDE扩展', '平均用时(秒)': avg_timing.get('hyde_expansion', 0.0)},
+                    {'阶段': 'Multi-Query扩展', '平均用时(秒)': avg_timing.get('multi_query_expansion', 0.0)},
+                    {'阶段': '向量搜索', '平均用时(秒)': avg_timing.get('vector_search', 0.0)},
+                    {'阶段': 'LLM重排序', '平均用时(秒)': avg_timing.get('llm_reranking', 0.0)},
+                    {'阶段': '上游扩充', '平均用时(秒)': avg_timing.get('upstream_expansion', 0.0)},
+                    {'阶段': '格式化结果', '平均用时(秒)': avg_timing.get('format_results', 0.0)},
+                    {'阶段': '生成答案', '平均用时(秒)': avg_timing.get('generate_answer', 0.0)},
+                    {'阶段': '总用时', '平均用时(秒)': avg_timing.get('total_time', 0.0)},
+                ])
+                st.dataframe(timing_df, use_container_width=True, hide_index=True)
+                
+                # 显示详细结果表格
+                st.markdown("### 📋 详细评估结果")
+                results_df = pd.DataFrame([
+                    {
+                        '问题': r['question'][:50] + '...' if len(r['question']) > 50 else r['question'],
+                        '标准答案': r['standard_answer'][:50] + '...' if len(r.get('standard_answer', '')) > 50 else r.get('standard_answer', ''),
+                        'RAG答案': r['rag_answer'][:50] + '...' if len(r.get('rag_answer', '')) > 50 else r.get('rag_answer', ''),
+                        '评分': r['score'],
+                        '是否正确': '✅' if r['is_correct'] else '❌',
+                        '状态': '跳过' if r.get('skipped', False) else '已评估'
+                    }
+                    for r in evaluation_results
+                ])
+                st.dataframe(results_df, use_container_width=True)
+            
+        except Exception as e:
+            st.error(f"❌ 评估过程出错: {str(e)}")
+            with st.expander("查看详细错误"):
+                st.code(traceback.format_exc())
     
-    except Exception as e:
-        st.error(f"❌ 评估过程出错: {str(e)}")
-        with st.expander("查看详细错误"):
-            st.code(traceback.format_exc())
-
-# 问答区域
-st.markdown("---")
+    # 问答区域
+    st.markdown("---")
 
 # 如果点击了示例问题，显示提示
 if st.session_state.get('example_clicked', False):
@@ -1783,7 +2077,7 @@ st.markdown("### 💡 投资者关注问题")
 
 # 加载问题库
 try:
-    questions_df = pd.read_csv("data/val_set/questions.csv")
+    questions_df = pd.read_csv("data/val_set/questions_selected_100.csv")
     total_questions = len(questions_df)
     st.markdown(f"点击下方问题可自动填入输入框 | 当前共有 **{total_questions}** 个问题")
 
@@ -1911,6 +2205,211 @@ if st.session_state.history:
                 answer = record['answer'].get('final_answer', record['answer'].get('answer', 'N/A'))
                 st.markdown(f"💡 **答案**: **{answer}**")
                 st.markdown("---")
+
+with main_tab2:
+    st.title("📊 评估结果分析")
+    st.markdown("分析不同参数配置下的评估结果，对比答案差异和统计指标")
+    
+    # 加载评估结果
+    evaluation_results = load_evaluation_results()
+    
+    if not evaluation_results:
+        st.warning("⚠️ 未找到评估结果文件。请先运行批量评估。")
+        st.info("评估结果文件应位于: `data/val_set/val_result/evaluation_*.json`")
+    else:
+        st.success(f"✅ 已加载 {len(evaluation_results)} 个评估结果文件")
+        
+        # 功能选择
+        analysis_mode = st.radio(
+            "选择分析模式",
+            ["问题对比", "配置统计"],
+            horizontal=True,
+            key="analysis_mode"
+        )
+        
+        if analysis_mode == "问题对比":
+            st.markdown("### 🔍 问题对比分析")
+            st.markdown("查看某个问题在不同参数配置下的回答差异")
+            
+            # 获取所有问题列表
+            all_questions = set()
+            for eval_data in evaluation_results:
+                for result in eval_data.get('results', []):
+                    all_questions.add(result.get('question', '').strip())
+            
+            if all_questions:
+                selected_question = st.selectbox(
+                    "选择要对比的问题",
+                    sorted(all_questions),
+                    key="question_compare_select"
+                )
+                
+                if selected_question:
+                    # 查找该问题在所有评估结果中的答案
+                    matches = find_question_across_results(selected_question, evaluation_results)
+                    
+                    if matches:
+                        st.markdown(f"#### 📋 找到 {len(matches)} 个配置下的答案")
+                        
+                        # 显示标准答案
+                        if matches[0].get('standard_answer'):
+                            st.info(f"📌 **标准答案**: {matches[0]['standard_answer']}")
+                        
+                        # 显示每个配置的答案
+                        for i, match in enumerate(matches, 1):
+                            with st.expander(
+                                f"配置 {i}: {match['config_summary']} | "
+                                f"得分: {match['score']:.2f} | "
+                                f"{'✅ 正确' if match['is_correct'] else '❌ 错误'} | "
+                                f"时间: {match['timestamp']}",
+                                expanded=(i == 1)
+                            ):
+                                col1, col2 = st.columns([2, 1])
+                                
+                                with col1:
+                                    st.markdown("**RAG生成的答案:**")
+                                    st.write(match['rag_answer'])
+                                
+                                with col2:
+                                    st.metric("评分", f"{match['score']:.2f}")
+                                    st.metric("是否正确", "✅" if match['is_correct'] else "❌")
+                                
+                                if match.get('reasoning'):
+                                    st.markdown("**评估理由:**")
+                                    st.caption(match['reasoning'])
+                                
+                                st.caption(f"文件: {match['file_name']}")
+                        
+                        # 对比表格
+                        st.markdown("#### 📊 对比表格")
+                        compare_df = pd.DataFrame([
+                            {
+                                '配置': match['config_summary'],
+                                '得分': match['score'],
+                                '是否正确': '✅' if match['is_correct'] else '❌',
+                                'RAG答案': match['rag_answer'][:100] + '...' if len(match['rag_answer']) > 100 else match['rag_answer'],
+                                '时间': match['timestamp']
+                            }
+                            for match in matches
+                        ])
+                        st.dataframe(compare_df, use_container_width=True, hide_index=True)
+                    else:
+                        st.warning("未找到该问题的评估结果")
+            else:
+                st.warning("未找到任何问题")
+        
+        elif analysis_mode == "配置统计":
+            st.markdown("### 📈 配置统计信息")
+            st.markdown("查看某个参数配置的评估统计结果")
+            
+            # 选择评估文件
+            eval_options = [
+                f"{eval_data['timestamp']} | {format_config_summary(eval_data.get('config', {}))} | "
+                f"准确率: {eval_data.get('accuracy', 0)*100:.1f}%"
+                for eval_data in evaluation_results
+            ]
+            
+            selected_idx = st.selectbox(
+                "选择评估结果",
+                range(len(evaluation_results)),
+                format_func=lambda x: eval_options[x],
+                key="config_stats_select"
+            )
+            
+            if selected_idx is not None:
+                selected_eval = evaluation_results[selected_idx]
+                config = selected_eval.get('config', {})
+                
+                # 显示配置信息
+                st.markdown("#### ⚙️ 配置参数")
+                config_cols = st.columns(3)
+                
+                with config_cols[0]:
+                    st.markdown("**检索增强:**")
+                    st.write(f"- HYDE: {'✅' if config.get('use_hyde') else '❌'}")
+                    st.write(f"- Multi-Query: {'✅' if config.get('use_multi_query') else '❌'}")
+                    if config.get('use_multi_query'):
+                        mq = config.get('multi_query_methods', {})
+                        st.write(f"  - 名词解释: {'✅' if mq.get('synonym') else '❌'}")
+                        st.write(f"  - 指标拆分: {'✅' if mq.get('subquestion') else '❌'}")
+                        st.write(f"  - 情景变体: {'✅' if mq.get('variant') else '❌'}")
+                
+                with config_cols[1]:
+                    st.markdown("**重排序与扩充:**")
+                    st.write(f"- LLM重排序: {'✅' if config.get('llm_reranking') else '❌'}")
+                    if config.get('llm_reranking'):
+                        st.write(f"  - 样本数: {config.get('rerank_sample_size', 'N/A')}")
+                    st.write(f"- 上游扩充: {'✅' if config.get('expand_upstream') else '❌'}")
+                    if config.get('expand_upstream'):
+                        st.write(f"  - Top-K: {config.get('expand_top_k', 'N/A')}")
+                        st.write(f"  - 扩充大小: ±{config.get('expand_context_size', 'N/A')}页")
+                
+                with config_cols[2]:
+                    st.markdown("**其他参数:**")
+                    st.write(f"- 最终检索数: {config.get('top_n_retrieval', 'N/A')}")
+                    st.write(f"- 回答模型: {config.get('answering_model', 'N/A')}")
+                    st.write(f"- 并发数: {config.get('parallel_requests', 'N/A')}")
+                
+                st.markdown("---")
+                
+                # 显示统计指标
+                st.markdown("#### 📊 评估统计")
+                stat_cols = st.columns(5)
+                
+                with stat_cols[0]:
+                    st.metric("总问题数", selected_eval.get('total_questions', 0))
+                with stat_cols[1]:
+                    st.metric("已评估", selected_eval.get('evaluated_count', 0))
+                with stat_cols[2]:
+                    st.metric("正确答案", selected_eval.get('correct_count', 0))
+                with stat_cols[3]:
+                    accuracy = selected_eval.get('accuracy', 0)
+                    st.metric("准确率", f"{accuracy*100:.2f}%")
+                with stat_cols[4]:
+                    st.metric("平均得分", f"{selected_eval.get('average_score', 0):.3f}")
+                
+                # 显示时间统计
+                avg_timing = selected_eval.get('average_timing', {})
+                if avg_timing:
+                    st.markdown("#### ⏱️ 平均用时（秒）")
+                    timing_df = pd.DataFrame([
+                        {'阶段': '初始化检索器', '平均用时(秒)': avg_timing.get('init_retriever', 0.0)},
+                        {'阶段': '向量检索', '平均用时(秒)': avg_timing.get('retrieval', 0.0)},
+                        {'阶段': 'HYDE扩展', '平均用时(秒)': avg_timing.get('hyde_expansion', 0.0)},
+                        {'阶段': 'Multi-Query扩展', '平均用时(秒)': avg_timing.get('multi_query_expansion', 0.0)},
+                        {'阶段': 'LLM重排序', '平均用时(秒)': avg_timing.get('llm_reranking', 0.0)},
+                        {'阶段': '上游扩充', '平均用时(秒)': avg_timing.get('upstream_expansion', 0.0)},
+                        {'阶段': '生成答案', '平均用时(秒)': avg_timing.get('generate_answer', 0.0)},
+                        {'阶段': '总用时', '平均用时(秒)': avg_timing.get('total_time', 0.0)},
+                    ])
+                    st.dataframe(timing_df, use_container_width=True, hide_index=True)
+                
+                # 显示详细结果
+                st.markdown("#### 📋 详细评估结果")
+                results = selected_eval.get('results', [])
+                if results:
+                    results_df = pd.DataFrame([
+                        {
+                            '问题': r.get('question', '')[:60] + '...' if len(r.get('question', '')) > 60 else r.get('question', ''),
+                            '标准答案': r.get('standard_answer', '')[:60] + '...' if len(r.get('standard_answer', '')) > 60 else r.get('standard_answer', ''),
+                            'RAG答案': r.get('rag_answer', '')[:60] + '...' if len(r.get('rag_answer', '')) > 60 else r.get('rag_answer', ''),
+                            '评分': r.get('score', 0.0),
+                            '是否正确': '✅' if r.get('is_correct', False) else '❌',
+                            '评估理由': r.get('reasoning', '')[:80] + '...' if len(r.get('reasoning', '')) > 80 else r.get('reasoning', '')
+                        }
+                        for r in results
+                    ])
+                    st.dataframe(results_df, use_container_width=True, hide_index=True)
+                    
+                    # 下载按钮
+                    st.download_button(
+                        label="📥 下载完整评估结果 (JSON)",
+                        data=json.dumps(selected_eval, ensure_ascii=False, indent=2),
+                        file_name=selected_eval.get('file_name', 'evaluation_result.json'),
+                        mime="application/json"
+                    )
+                else:
+                    st.warning("该评估结果中没有详细数据")
 
 # 页脚
 st.markdown("---")

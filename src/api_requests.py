@@ -21,6 +21,16 @@ import json
 
 from tenacity import retry, stop_after_attempt, wait_fixed
 
+
+def _log_retry_attempt(retry_state):
+    """记录重试尝试的日志函数"""
+    exception = retry_state.outcome.exception()
+    print(f"\n[Qwen API] 遇到错误: {str(exception)}")
+    print("等待50秒后重试...\n")
+    import sys
+    sys.stdout.flush()
+
+
 class BaseQwenProcessor:
         def __init__(self):
             load_dotenv()
@@ -29,7 +39,7 @@ class BaseQwenProcessor:
             self.base_url = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
             self.default_model = "qwen-turbo"  # 可根据实际模型名调整
             self.response_data = None  # 新增：用于保存最近一次API响应内容
-        
+
         def _safe_flush(self):
             """安全地刷新标准输出，忽略 BrokenPipeError"""
             import sys
@@ -123,6 +133,11 @@ class BaseQwenProcessor:
         #     self.base_url = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
         #     self.default_model = "qwen-turbo"  # 可根据实际模型名调整
 
+        @retry(
+            wait=wait_fixed(50),
+            stop=stop_after_attempt(3),
+            before_sleep=_log_retry_attempt
+        )
         def send_message(
             self,
             model=None,
@@ -165,6 +180,20 @@ class BaseQwenProcessor:
             if response.status_code != 200:
                 print(f"[ERROR] [Qwen API] Full error response: {response.text}")
                 self._safe_flush()
+            
+            # 检测速率限制错误，抛出异常触发重试
+            if response.status_code == 429:
+                error_text = response.text
+                try:
+                    error_json = response.json()
+                    error_code = error_json.get("code", "")
+                    error_message = error_json.get("message", "")
+                    if error_code == "Throttling.AllocationQuota" or "rate limit" in error_message.lower():
+                        raise Exception(f"Qwen API 速率限制: {error_message}")
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                # 即使解析失败，429状态码也应该触发重试
+                raise Exception(f"Qwen API 速率限制 (HTTP 429): {response.text[:200]}")
             
             response.raise_for_status()
             result = response.json()
