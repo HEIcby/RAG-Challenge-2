@@ -1,129 +1,101 @@
-# 📚 文档导航
+# 文档目录
 
-> 金盘科技 RAG 智能问答系统 - 完整文档
+本目录包含项目的所有技术文档和使用指南。
 
----
+## 📁 目录结构
 
-## 📖 主要文档
-
-### 1. [用户使用手册](USER_GUIDE.md)
-**适用对象**: 终端用户  
-**内容**: 
-- Streamlit前端使用说明
-- 问题库功能
-- 多轮对话配置
-- 常见问题FAQ
-
-### 2. [部署指南](deployment/DEPLOYMENT_GUIDE.md)
-**适用对象**: 运维人员、开发者  
-**内容**:
-- 🏠 本地部署 - 使用 `scripts/setup/install_streamlit.sh`
-- 🌐 服务器部署 - 生产环境配置
-- 系统要求与依赖
-- 故障排查指南
-
-### 3. [项目经验总结](development/LESSONS_LEARNED.md) ⭐
-**适用对象**: 开发者、维护者  
-**内容**:
-- 核心技术经验
-- 关键问题与解决方案
-- 最佳实践
-- 快速参考
-
-### 4. [项目结构说明](development/PROJECT_STRUCTURE.md)
-**适用对象**: 开发者  
-**内容**:
-- 目录组织
-- 模块说明
-- 代码架构
-
----
-
-## 🚀 快速开始
-
-**新用户**: 阅读 [主 README](../README.md) → 运行 `./scripts/setup/install_streamlit.sh` → [USER_GUIDE.md](USER_GUIDE.md)  
-**开发者**: 阅读 [PROJECT_STRUCTURE](development/PROJECT_STRUCTURE.md) → [LESSONS_LEARNED](development/LESSONS_LEARNED.md)  
-**运维人员**: 阅读 [DEPLOYMENT_GUIDE](deployment/DEPLOYMENT_GUIDE.md)
-
----
-
-## 📋 文档清单
-
-| 文档 | 位置 | 最后更新 | 描述 |
-|------|------|----------|------|
-| USER_GUIDE.md | docs/ | 2024-11-06 | 用户使用手册 |
-| DEPLOYMENT_GUIDE.md | docs/deployment/ | 2025-11-10 | 部署指南 ⭐ |
-| **DEPLOYMENT_10.222.4.30.md** | **docs/** | **2025-11-10** | **生产服务器部署记录** 🆕 |
-| LESSONS_LEARNED.md | docs/development/ | 2025-11-07 | 经验总结 |
-| PROJECT_STRUCTURE.md | docs/development/ | 2024-11-06 | 项目结构 |
-
-### 🆕 新增文档
-
-- **[DEPLOYMENT_10.222.4.30.md](DEPLOYMENT_10.222.4.30.md)** - 详细记录了实际服务器（10.222.4.30）的完整部署过程，包括：
-  - 遇到的所有问题和解决方案
-  - 性能数据和资源使用情况
-  - 维护命令和调试技巧
-  - 138分钟完整部署时间线
-
----
-
-## ⚡ 快速参考
-
-### 本地部署快速命令
-
-```bash
-# 1. 克隆项目
-git clone https://github.com/HEIcby/RAG-Challenge-2.git
-cd RAG-Challenge-2
-
-# 2. 安装依赖
-./scripts/setup/install_streamlit.sh
-
-# 3. 配置 API
-cp .env.example .env
-nano .env  # 填入你的 API keys
-
-# 4. 启动服务
-./scripts/start_frontend.sh
+```
+docs/
+├── README.md                          # 本文档
+├── USER_GUIDE.md                      # 用户使用指南
+├── LOCAL_DEPLOYMENT.md                # 本地部署指南
+├── DEPLOYMENT_10.222.4.30.md          # 服务器部署指南
+│
+├── deployment/                         # 部署相关文档
+│   ├── DEPLOYMENT_GUIDE.md
+│   ├── DEPLOYMENT.md
+│   └── DEPLOYMENT_QUICK.md
+│
+├── development/                        # 开发相关文档
+│   ├── PROJECT_STRUCTURE.md           # 项目结构说明
+│   ├── LESSONS_LEARNED.md             # 开发经验总结
+│   └── LESSONS_LEARNED_v2.md
+│
+├── retrieval_algorithms/               # 检索算法相关文档
+│   ├── retrieval_algorithms_update_20251203.md  # 检索算法更新汇报（最新）
+│   ├── 移植指南_SSG_Traversal_和_Triangulation_FullDim.md  # SSG和Triangulation移植指南
+│   └── BASIC_RETRIEVAL_LOGIC_ANALYSIS.md  # 基础检索逻辑分析
+│
+└── archives/                           # 历史文档归档
+    ├── DEPLOYMENT_10.222.4.30.md
+    ├── DOCUMENTATION_CLEANUP_2025-11-07.md
+    ├── DOCUMENTATION_SUMMARY.md
+    └── ...
 ```
 
-### 关键概念
-- **1-based vs 0-based**: 索引标准处理
-- **时间智能路由**: 年份提取与文档路由
-- **精确数据优先**: 提示词约束原则
-- **页码验证**: 防止幻觉机制
+## 📚 文档分类
 
-### 关键文件
-```
-src/prompts.py:606-814       # 金盘答案生成提示词
-src/retrieval.py:17-51       # 时间路由逻辑
-app_jinpan_qa.py:176-220     # PDF页面图片提取
-app_jinpan_qa.py:256-305     # 参考来源显示
-```
+### 🚀 快速开始
 
-### 常用命令
-```bash
-# 启动服务（本地）
-./scripts/start_frontend.sh
+- **[USER_GUIDE.md](./USER_GUIDE.md)**: 用户使用指南，包含基本操作和功能介绍
+- **[LOCAL_DEPLOYMENT.md](./LOCAL_DEPLOYMENT.md)**: 本地部署指南，快速搭建开发环境
 
-# 重新安装依赖
-./scripts/setup/install_streamlit.sh
+### 🔧 部署文档
 
-# 停止服务
-pkill -f streamlit
-```
+- **[deployment/DEPLOYMENT_GUIDE.md](./deployment/DEPLOYMENT_GUIDE.md)**: 详细部署指南
+- **[deployment/DEPLOYMENT_QUICK.md](./deployment/DEPLOYMENT_QUICK.md)**: 快速部署指南
+- **[DEPLOYMENT_10.222.4.30.md](./DEPLOYMENT_10.222.4.30.md)**: 特定服务器部署指南
+
+### 🧠 检索算法
+
+- **[retrieval_algorithms/retrieval_algorithms_update_20251203.md](./retrieval_algorithms/retrieval_algorithms_update_20251203.md)**: 
+  - 最新检索算法更新汇报
+  - 包含SSG Traversal、Triangulation FullDim和Hybrid Expansion的详细介绍
+  - 技术改进和性能分析
+
+- **[retrieval_algorithms/移植指南_SSG_Traversal_和_Triangulation_FullDim.md](./retrieval_algorithms/移植指南_SSG_Traversal_和_Triangulation_FullDim.md)**: 
+  - SSG和Triangulation算法的移植指南
+  - 算法原理和实现细节
+
+- **[retrieval_algorithms/BASIC_RETRIEVAL_LOGIC_ANALYSIS.md](./retrieval_algorithms/BASIC_RETRIEVAL_LOGIC_ANALYSIS.md)**: 
+  - 基础检索逻辑的详细分析
+  - 代码流程和关键逻辑
+
+### 💻 开发文档
+
+- **[development/PROJECT_STRUCTURE.md](./development/PROJECT_STRUCTURE.md)**: 项目结构说明
+- **[development/LESSONS_LEARNED.md](./development/LESSONS_LEARNED.md)**: 开发经验总结
+
+## 🔍 快速查找
+
+### 按主题查找
+
+- **检索算法**: 查看 `retrieval_algorithms/` 目录
+- **部署相关**: 查看 `deployment/` 目录
+- **开发指南**: 查看 `development/` 目录
+- **历史文档**: 查看 `archives/` 目录
+
+### 按日期查找
+
+- **2025-12-03**: 检索算法更新汇报
+- **2025-11-07**: 历史文档归档
+
+## 📝 文档维护
+
+- 新增文档请按照分类放入对应目录
+- 重要更新请在文档标题中标注日期
+- 过时文档请移至 `archives/` 目录
+
+## 🤝 贡献指南
+
+1. 新增文档前，请先检查是否已有相关内容
+2. 文档命名使用清晰的描述性名称
+3. 重要技术文档请包含：
+   - 概述
+   - 详细说明
+   - 使用示例
+   - 注意事项
 
 ---
 
-## 📞 获取帮助
-
-- **用户问题**: 查看 [USER_GUIDE.md](USER_GUIDE.md)
-- **本地部署**: 运行 `./scripts/setup/install_streamlit.sh`
-- **技术问题**: 查看 [LESSONS_LEARNED.md](development/LESSONS_LEARNED.md)
-- **服务器部署**: 查看 [DEPLOYMENT_GUIDE.md](deployment/DEPLOYMENT_GUIDE.md)
-- **提交Issue**: [GitHub Issues](https://github.com/HEIcby/RAG-Challenge-2/issues)
-
----
-
-**最后更新**: 2025-11-10  
-**维护者**: Ocean Chen
+**最后更新**: 2025-12-03

@@ -32,7 +32,10 @@ class QuestionsProcessor:
         expand_upstream: bool = False,
         expand_top_k: int = 5,
         expand_context_size: int = 2,
-        multi_query_methods: Optional[Dict[str, bool]] = None
+        multi_query_methods: Optional[Dict[str, bool]] = None,
+        retrieval_method: str = "basic",
+        max_hops: int = 4,
+        neighbor_k: int = 30
     ):
         print(f"[QuestionsProcessor] LLM provider: {api_provider}")
         print(f"[QuestionsProcessor] Answering model: {answering_model}")
@@ -62,6 +65,9 @@ class QuestionsProcessor:
             'subquestion': True,
             'variant': True
         }
+        self.retrieval_method = retrieval_method
+        self.max_hops = max_hops
+        self.neighbor_k = neighbor_k
         #print(f"[DEBUG][QuestionsProcessor.__init__] use_hyde={self.use_hyde}, use_multi_query={self.use_multi_query}")
 
         self.answer_details = []
@@ -148,7 +154,7 @@ class QuestionsProcessor:
         
         for group_id, result in enumerate(top_results):
             core_page = result.get('page')
-            core_score = result.get('combined_score') or result.get('distance', 0.0)
+            core_score = result.get('combined_score') or result.get('vector_similarity', result.get('distance', 0.0))
             source_sha1 = result.get('source_sha1', '')
             
             # 构造组合页面列表（上下各context_size页）
@@ -309,7 +315,7 @@ class QuestionsProcessor:
                 'group_score': 0.92,
                 'group_id': 0,
                 'core_page': 10,
-                'distance': 0.85  # 继承核心页的向量得分
+                'vector_similarity': 0.85  # 继承核心页的向量得分
             }
         """
         # 构建page -> result的映射，用于获取已有文本
@@ -333,7 +339,7 @@ class QuestionsProcessor:
                 # 尝试从检索结果获取文本
                 if page in page_to_result:
                     text = page_to_result[page].get('text', '')
-                    vector_score = page_to_result[page].get('distance', 0.0)
+                    vector_score = page_to_result[page].get('vector_similarity', page_to_result[page].get('distance', 0.0))
                 else:
                     # 从原始文档加载
                     text = self._load_page_text_from_document(source_sha1, page)
@@ -347,7 +353,7 @@ class QuestionsProcessor:
                     'group_score': core_score,  # 组合得分
                     'group_id': group_id,
                     'core_page': core_page,
-                    'distance': vector_score,  # 向量得分
+                    'vector_similarity': vector_score,  # 向量得分
                     'relevance_score': None,  # 扩充页面没有LLM相关性得分
                     'combined_score': core_score if is_core else None  # 只有核心页有组合得分
                 }
@@ -460,7 +466,7 @@ class QuestionsProcessor:
             source_sha1 = result.get('source_sha1', '')
             
             # 得分构成详细信息
-            vector_score = result.get('distance', 0.0)  # 向量相似度得分
+            vector_score = result.get('vector_similarity', result.get('distance', 0.0))  # 向量相似度得分
             relevance_score = result.get('relevance_score', None)  # LLM相关性得分（重排序时才有）
             combined_score = result.get('combined_score', None)  # 组合得分（重排序时才有）
             reasoning = result.get('reasoning', '')  # LLM推理过程（重排序时才有）
@@ -480,6 +486,49 @@ class QuestionsProcessor:
                 "reasoning": reasoning,
                 "selected_by_llm": is_core_selected,  # LLM直接选用
                 "is_expanded": is_expanded  # 相邻扩充页面
+            })
+        
+        return formatted_chunks
+    
+    def _format_initial_retrieval_chunks(self, initial_retrieval_results: list) -> list:
+        """
+        Format initial retrieval results (before reranking).
+        
+        Args:
+            initial_retrieval_results: List of initial retrieval results (before reranking)
+        
+        Returns:
+            List of formatted chunks with metadata
+        """
+        formatted_chunks = []
+        
+        for idx, result in enumerate(initial_retrieval_results, 1):
+            page = result.get('page')
+            text = result.get('text', '')
+            source_sha1 = result.get('source_sha1', '')
+            vector_similarity = result.get('vector_similarity', result.get('distance', 0.0))  # 最终向量相似度得分（加权后）
+            hit_count = result.get('hit_count', 1)  # 被命中的次数（多查询聚合时可能有多次命中）
+            # 原始向量相似度最高分：如果有max_original_score字段就用它，否则用vector_similarity（单次命中时相等）
+            max_original_score = result.get('max_original_similarity', result.get('max_original_score', vector_similarity))
+            # 检索方法来源
+            retrieval_sources = result.get('retrieval_sources', ['basic'])
+            query_sources = result.get('query_sources', [])
+            
+            formatted_chunks.append({
+                "rank": idx,
+                "page": page,
+                "source_sha1": source_sha1,
+                "text": text,
+                "vector_score": vector_similarity,  # 最终向量相似度得分（加权后，用于排序）
+                "max_original_score": max_original_score,  # 原始向量相似度最高分
+                "hit_count": hit_count,  # 被多个查询命中的次数
+                "retrieval_sources": retrieval_sources,  # 检索方法来源列表
+                "query_sources": query_sources,  # 查询来源列表
+                "relevance_score": None,  # 初始召回结果没有LLM相关性得分
+                "combined_score": None,  # 初始召回结果没有组合得分
+                "reasoning": None,  # 初始召回结果没有LLM推理
+                "selected_by_llm": False,  # 初始召回结果还没有经过LLM选择
+                "is_expanded": False  # 初始召回结果还没有经过扩充
             })
         
         return formatted_chunks
@@ -566,8 +615,17 @@ class QuestionsProcessor:
                 use_multi_query=self.use_multi_query,
                 subset_path=self.subset_path,
                 parallel_workers=self.parallel_requests,
-                multi_query_methods=self.multi_query_methods
+                multi_query_methods=self.multi_query_methods,
+                retrieval_method=self.retrieval_method,
+                max_hops=self.max_hops,
+                neighbor_k=self.neighbor_k
             )
+            # 动态更新 HybridRetriever 内部的 VectorRetriever 实例变量
+            if hasattr(retriever, 'vector_retriever'):
+                retriever.vector_retriever.retrieval_method = self.retrieval_method
+                retriever.vector_retriever.max_hops = self.max_hops
+                retriever.vector_retriever.neighbor_k = self.neighbor_k
+                print(f"[DEBUG][QuestionsProcessor] 已更新 HybridRetriever.vector_retriever: retrieval_method={self.retrieval_method}, max_hops={self.max_hops}, neighbor_k={self.neighbor_k}")
         else:
             retriever = VectorRetriever(
                 vector_db_dir=self.vector_db_dir,
@@ -576,8 +634,16 @@ class QuestionsProcessor:
                 use_multi_query=self.use_multi_query,
                 subset_path=self.subset_path,
                 parallel_workers=self.parallel_requests,
-                multi_query_methods=self.multi_query_methods
+                multi_query_methods=self.multi_query_methods,
+                retrieval_method=self.retrieval_method,
+                max_hops=self.max_hops,
+                neighbor_k=self.neighbor_k
             )
+            # 动态更新 VectorRetriever 实例变量（确保使用最新的值）
+            retriever.retrieval_method = self.retrieval_method
+            retriever.max_hops = self.max_hops
+            retriever.neighbor_k = self.neighbor_k
+            print(f"[DEBUG][QuestionsProcessor] 已更新 VectorRetriever: retrieval_method={self.retrieval_method}, max_hops={self.max_hops}, neighbor_k={self.neighbor_k}")
         timing_info['init_retriever'] = time.time() - init_start
 
         # 阶段 2: 召回相关文档
@@ -604,7 +670,10 @@ class QuestionsProcessor:
                     use_multi_query=self.use_multi_query,
                     multi_query_config=self.multi_query_methods,
                     progress_callback=progress_callback,
-                    selected_years=selected_years
+                    selected_years=selected_years,
+                    retrieval_method=self.retrieval_method,
+                    max_hops=self.max_hops,
+                    neighbor_k=self.neighbor_k
                 )
             else:
                 # HybridRetriever 也需要传递 progress_callback
@@ -618,13 +687,20 @@ class QuestionsProcessor:
                     use_multi_query=self.use_multi_query,
                     multi_query_config=self.multi_query_methods,
                     progress_callback=progress_callback,
-                    selected_years=selected_years
+                    selected_years=selected_years,
+                    retrieval_method=self.retrieval_method,
+                    max_hops=self.max_hops,
+                    neighbor_k=self.neighbor_k
                 )
             timing_info['retrieval'] = time.time() - retrieval_start
         
         # 处理检索结果（可能是dict或list）
         expansion_texts = {}
         reranker_stats = {}
+        retrieval_details = None
+        initial_retrieval_results = None  # 保存初始召回结果（reranking前）
+        original_retrieval_dict = None  # 保存原始结果字典（用于未启用LLM重排序时）
+        algorithm_contribution = None  # 算法贡献统计（仅hybrid_expansion）
         if isinstance(retrieval_results, dict):
             # 提取扩展文本信息
             if 'expansion_texts' in retrieval_results:
@@ -634,6 +710,20 @@ class QuestionsProcessor:
                 timing_info.update(retrieval_results['timing'])
             if 'reranker_stats' in retrieval_results:
                 reranker_stats = retrieval_results['reranker_stats']
+            # 提取检索详情（包含检索路径等信息）
+            if 'retrieval_details' in retrieval_results:
+                retrieval_details = retrieval_results['retrieval_details']
+            # 提取初始召回结果（reranking前的原始结果）
+            if 'initial_retrieval_results' in retrieval_results:
+                initial_retrieval_results = retrieval_results['initial_retrieval_results']
+            # 提取算法贡献信息（仅hybrid_expansion）
+            if 'algorithm_contribution' in retrieval_results:
+                algorithm_contribution = retrieval_results['algorithm_contribution']
+                print(f"[DEBUG][QuestionsProcessor] ✅ 提取到algorithm_contribution: {algorithm_contribution is not None}, keys={list(algorithm_contribution.keys()) if algorithm_contribution else []}")
+            else:
+                print(f"[DEBUG][QuestionsProcessor] ⚠️ retrieval_results中没有algorithm_contribution字段, keys={list(retrieval_results.keys())}")
+            # 保存原始结果字典（用于未启用LLM重排序时）
+            original_retrieval_dict = retrieval_results.copy()
             # 提取结果
             if 'results' in retrieval_results:
                 retrieval_results = retrieval_results['results']
@@ -773,6 +863,8 @@ class QuestionsProcessor:
             answer_dict['expansion_texts'] = expansion_texts
             if reranker_stats:
                 answer_dict['reranker_stats'] = reranker_stats
+            if retrieval_details:
+                answer_dict['retrieval_details'] = retrieval_details
         
         # 防御性检查：确保返回的是字典而不是列表
         if isinstance(answer_dict, list):
@@ -867,6 +959,30 @@ class QuestionsProcessor:
                 validated_pages,
                 expanded_pages
             )
+            
+            # 添加初始召回结果（reranking前的原始结果）
+            if initial_retrieval_results:
+                # 启用LLM重排序时，使用reranking前的初始结果
+                answer_dict["initial_retrieval_results"] = self._format_initial_retrieval_chunks(
+                    initial_retrieval_results
+                )
+            elif not self.llm_reranking and original_retrieval_dict and 'results' in original_retrieval_dict:
+                # 未启用LLM重排序时，VectorRetriever返回的结果就是初始召回结果
+                answer_dict["initial_retrieval_results"] = self._format_initial_retrieval_chunks(
+                    original_retrieval_dict['results']
+                )
+            elif not self.llm_reranking and isinstance(retrieval_results, list):
+                # 兼容处理：如果retrieval_results直接是列表
+                answer_dict["initial_retrieval_results"] = self._format_initial_retrieval_chunks(
+                    retrieval_results
+                )
+            
+            # 添加算法贡献信息（仅hybrid_expansion）
+            if algorithm_contribution:
+                answer_dict["algorithm_contribution"] = algorithm_contribution
+                print(f"[DEBUG][QuestionsProcessor] ✅ 已将algorithm_contribution添加到answer_dict")
+            else:
+                print(f"[DEBUG][QuestionsProcessor] ⚠️ algorithm_contribution为None，未添加到answer_dict")
         return answer_dict
     
     def _build_contextual_question(self, current_question: str, conversation_history: Optional[List[Dict]] = None) -> str:

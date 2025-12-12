@@ -40,11 +40,15 @@ def backup_file(file_path: Path) -> Path:
 
 
 def identify_failed_evaluations(data: Dict) -> List[int]:
-    """识别所有reasoning为空的问题索引"""
+    """识别所有reasoning为空或包含评估失败的问题索引"""
     failed_indices = []
     for i, result in enumerate(data.get("results", [])):
         reasoning = result.get("reasoning", "")
-        if not reasoning or not reasoning.strip():
+        score = result.get("score", 0.0)
+        # 检查reasoning为空，或包含"评估失败"，或score=0.0且reasoning包含错误信息
+        if (not reasoning or not reasoning.strip() or 
+            "评估失败" in reasoning or 
+            (score == 0.0 and ("评估返回的reasoning为空" in reasoning or "评估失败" in reasoning))):
             failed_indices.append(i)
     return failed_indices
 

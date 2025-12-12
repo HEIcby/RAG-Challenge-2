@@ -361,7 +361,7 @@ class LLMReranker:
                     doc_with_score["relevance_score"] = rank.get("relevance_score", 0.0)
                     doc_with_score["reasoning"] = rank.get("reasoning", "No reasoning provided.")
                     doc_with_score["combined_score"] = round(
-                        doc_with_score["relevance_score"] * doc['distance'],
+                        doc_with_score["relevance_score"] * doc.get('vector_similarity', doc.get('distance', 0.0)),
                         4
                     )
                     results.append(doc_with_score)

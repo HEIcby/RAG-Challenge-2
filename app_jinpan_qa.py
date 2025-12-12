@@ -232,6 +232,8 @@ if 'history' not in st.session_state:
     st.session_state.history = []
 if 'initialized' not in st.session_state:
     st.session_state.initialized = False
+if 'answer_dict' not in st.session_state:
+    st.session_state.answer_dict = None
 if 'current_question' not in st.session_state:
     st.session_state.current_question = ""
 if 'current_schema' not in st.session_state:
@@ -285,7 +287,10 @@ def initialize_system():
                 multi_query_methods=config.get('multi_query_methods'),
                 expand_upstream=config.get('expand_upstream', False),
                 expand_top_k=config.get('expand_top_k', 5),
-                expand_context_size=config.get('expand_context_size', 1)
+                expand_context_size=config.get('expand_context_size', 1),
+                retrieval_method=config.get('retrieval_method', 'basic'),
+                max_hops=config.get('max_hops', 4),
+                neighbor_k=config.get('neighbor_k', 30)
             )
             
             st.session_state.processor = processor
@@ -458,7 +463,7 @@ def format_answer_display(answer_dict: dict, question: str = ""):
             st.dataframe(timing_df, use_container_width=True, hide_index=True)
     
     # 创建标签页
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔍 分析过程", "📝 推理总结", "📚 LLM选用的参考", "🗂️ 所有检索结果", "💬 生成提示词"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["🔍 分析过程", "📝 推理总结", "📚 LLM选用的参考", "🗂️ 所有检索结果", "📋 初始召回结果", "🔄 查询扩展详解", "💬 生成提示词", "🔬 算法贡献分析"])
     
     with tab1:
         if "step_by_step_analysis" in answer_dict:
@@ -714,17 +719,17 @@ def format_answer_display(answer_dict: dict, question: str = ""):
                     st.markdown(f"""
                     <div style="background-color: #f8f9fa; padding: 10px; border-radius: 5px; margin-bottom: 10px; border-left: 4px solid {border_color};">
                         <div style="display: flex; justify-content: space-between; align-items: center;">
-                            <div>
-                                <strong>📁 文档:</strong> {doc_display_name} | 
-                                <strong>📄 页码:</strong> {page} |
-                                <strong>🏆 排名:</strong> #{rank}
+                            <div style="color: #333;">
+                                <strong style="color: #333;">📁 文档:</strong> <span style="color: #333;">{doc_display_name}</span> | 
+                                <strong style="color: #333;">📄 页码:</strong> <span style="color: #333;">{page}</span> |
+                                <strong style="color: #333;">🏆 排名:</strong> <span style="color: #333;">#{rank}</span>
                             </div>
                             <div>
                                 {badge}
                             </div>
                         </div>
-                        <div style="margin-top: 8px; font-size: 0.9em;">
-                            <strong>🔗 SHA1:</strong> <code>{source_sha1}</code>
+                        <div style="margin-top: 8px; font-size: 0.9em; color: #333;">
+                            <strong style="color: #333;">🔗 SHA1:</strong> <code style="color: #333; background-color: #e9ecef; padding: 2px 6px; border-radius: 3px;">{source_sha1}</code>
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
@@ -772,6 +777,475 @@ def format_answer_display(answer_dict: dict, question: str = ""):
             st.info("无检索结果信息")
     
     with tab5:
+        # 显示初始召回结果（reranking前的原始结果）
+        # 优先使用session_state中的answer_dict，如果没有则使用传入的参数
+        current_answer_dict = st.session_state.get("answer_dict") or answer_dict
+        
+        # 检查answer_dict是否存在且包含initial_retrieval_results
+        has_initial_results = (
+            current_answer_dict and 
+            "initial_retrieval_results" in current_answer_dict and 
+            current_answer_dict["initial_retrieval_results"]
+        )
+        
+        if has_initial_results:
+            initial_chunks = current_answer_dict["initial_retrieval_results"]
+            
+            # 加载文档映射
+            doc_mapping = load_document_mapping("data/val_set/subset.csv")
+            
+            st.markdown(f"### 📋 初始召回结果（LLM重排序前）")
+            st.caption(f"共检索到 {len(initial_chunks)} 个文本块（这是截断前的完整结果，包含所有扩展后的page/chunk，不仅仅是Top-50）")
+            
+            # 统计信息
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("初始召回数", len(initial_chunks))
+            with col2:
+                # 统计有多次命中的chunks
+                multi_hit_count = sum(1 for chunk in initial_chunks if chunk.get('hit_count', 1) > 1)
+                st.metric("多次命中", multi_hit_count, help="被多个查询（HYDE/Multi-Query）同时命中的chunks")
+            with col3:
+                # 计算平均向量得分
+                valid_scores = [chunk.get('vector_score', 0) for chunk in initial_chunks if chunk.get('vector_score') is not None]
+                avg_vector = sum(valid_scores) / len(valid_scores) if valid_scores else 0
+                st.metric("平均向量得分", f"{avg_vector:.4f}")
+            with col4:
+                st.info("📊 纯向量检索")
+            
+            # 如果是混合扩展模式，显示SSG和Triangulation的扩展统计
+            if "algorithm_contribution" in answer_dict and answer_dict["algorithm_contribution"]:
+                algo_contrib = answer_dict["algorithm_contribution"]
+                ssg_stats = algo_contrib.get("ssg_stats", {})
+                tri_stats = algo_contrib.get("triangulation_stats", {})
+                
+                if ssg_stats or tri_stats:
+                    st.markdown("---")
+                    st.markdown("### 🔬 扩展算法统计（混合扩展模式）")
+                    
+                    if ssg_stats:
+                        ssg_total = ssg_stats.get("total_expanded", 0)
+                        ssg_new = ssg_stats.get("new_only", 0)
+                        ssg_in_basic = ssg_stats.get("in_basic_top50", 0)
+                        
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("🔗 SSG总扩展数", ssg_total)
+                        with col2:
+                            st.metric("🔗 SSG新发现", ssg_new, help="仅由SSG召回，不在Basic Top-50中的chunk数")
+                        with col3:
+                            st.metric("🔗 SSG重叠数", ssg_in_basic, help="SSG扩展但已在Basic Top-50中的chunk数")
+                        
+                        st.caption(f"🔗 SSG扩展统计: 总扩展数={ssg_total}, 仅SSG召回的chunk数={ssg_new}, 已在Basic Top-50中的chunk数={ssg_in_basic}")
+                    
+                    if tri_stats:
+                        tri_total = tri_stats.get("total_expanded", 0)
+                        tri_new = tri_stats.get("new_only", 0)
+                        tri_in_basic = tri_stats.get("in_basic_top50", 0)
+                        
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("🔺 Triangulation总扩展数", tri_total)
+                        with col2:
+                            st.metric("🔺 Triangulation新发现", tri_new, help="仅由Triangulation召回，不在Basic Top-50中的chunk数")
+                        with col3:
+                            st.metric("🔺 Triangulation重叠数", tri_in_basic, help="Triangulation扩展但已在Basic Top-50中的chunk数")
+                        
+                        st.caption(f"🔺 Triangulation扩展统计: 总扩展数={tri_total}, 仅Triangulation召回的chunk数={tri_new}, 已在Basic Top-50中的chunk数={tri_in_basic}")
+            
+            st.markdown("---")
+            
+            # 显示新发现的Chunk（chunk级别，不在Basic Top-50中）
+            if "algorithm_contribution" in answer_dict and answer_dict["algorithm_contribution"]:
+                algo_contrib = answer_dict["algorithm_contribution"]
+                ssg_new_chunks = algo_contrib.get("ssg_new_chunks", [])
+                tri_new_chunks = algo_contrib.get("triangulation_new_chunks", [])
+                
+                if ssg_new_chunks or tri_new_chunks:
+                    st.markdown("### 🆕 新发现的Chunk（Chunk级别，不在Basic Top-50中）")
+                    st.caption("这些是SSG和Triangulation算法额外发现的chunk，它们不在Basic检索的Top-50结果中。注意：这些是chunk级别的结果，可能与上面的page级别结果不同。")
+                    
+                    new_cols = st.columns(3)
+                    with new_cols[0]:
+                        st.metric("🔗 SSG新发现", len(ssg_new_chunks))
+                    with new_cols[1]:
+                        st.metric("🔺 Triangulation新发现", len(tri_new_chunks))
+                    with new_cols[2]:
+                        st.metric("新发现总数", len(ssg_new_chunks) + len(tri_new_chunks))
+                    
+                    # 显示SSG新发现的chunk
+                    if ssg_new_chunks:
+                        st.markdown("#### 🔗 SSG新发现的Chunk")
+                        for idx, chunk_info in enumerate(ssg_new_chunks, 1):
+                            page = chunk_info.get('page', 'N/A')
+                            text = chunk_info.get('text', '')
+                            similarity = chunk_info.get('vector_similarity', 0.0)
+                            anchor_page = chunk_info.get('anchor_page', 'N/A')
+                            source_sha1 = chunk_info.get('source_sha1', '')
+                            
+                            doc_info = doc_mapping.get(source_sha1, {})
+                            doc_display_name = doc_info.get('display_name', source_sha1)
+                            
+                            with st.expander(f"🔗 #{idx} - {doc_display_name} 第{page}页 (相似度: {similarity:.4f}, 从Anchor {anchor_page}扩展)", expanded=False):
+                                st.markdown(f"**📄 页码:** {page}")
+                                st.markdown(f"**🎯 Anchor页面:** {anchor_page}")
+                                st.markdown(f"**📊 向量相似度:** {similarity:.4f}")
+                                st.markdown(f"**📁 文档:** {doc_display_name}")
+                                st.markdown(f"**🔗 SHA1:** `{source_sha1}`")
+                                st.markdown("**📝 文本内容:**")
+                                st.text_area("", text, height=150, key=f"ssg_new_{idx}", label_visibility="collapsed")
+                    
+                    # 显示Triangulation新发现的chunk
+                    if tri_new_chunks:
+                        st.markdown("#### 🔺 Triangulation新发现的Chunk")
+                        for idx, chunk_info in enumerate(tri_new_chunks, 1):
+                            page = chunk_info.get('page', 'N/A')
+                            text = chunk_info.get('text', '')
+                            similarity = chunk_info.get('vector_similarity', 0.0)
+                            anchor_page = chunk_info.get('anchor_page', 'N/A')
+                            source_sha1 = chunk_info.get('source_sha1', '')
+                            
+                            doc_info = doc_mapping.get(source_sha1, {})
+                            doc_display_name = doc_info.get('display_name', source_sha1)
+                            
+                            with st.expander(f"🔺 #{idx} - {doc_display_name} 第{page}页 (相似度: {similarity:.4f}, 从Anchor {anchor_page}扩展)", expanded=False):
+                                st.markdown(f"**📄 页码:** {page}")
+                                st.markdown(f"**🎯 Anchor页面:** {anchor_page}")
+                                st.markdown(f"**📊 向量相似度:** {similarity:.4f}")
+                                st.markdown(f"**📁 文档:** {doc_display_name}")
+                                st.markdown(f"**🔗 SHA1:** `{source_sha1}`")
+                                st.markdown("**📝 文本内容:**")
+                                st.text_area("", text, height=150, key=f"tri_new_{idx}", label_visibility="collapsed")
+                    
+                    st.markdown("---")
+            
+            # 按得分排序显示（Page级别）
+            st.markdown("### 📋 Page级别召回结果（按得分排序，完整结果）")
+            st.caption(f"以下是聚合后的Page级别结果（如果启用了父文档检索，同一Page的多个Chunk会被聚合为一个Page）。共 {len(initial_chunks)} 个结果（截断前的完整结果，不仅仅是Top-50）")
+            
+            # 添加搜索功能
+            search_col1, search_col2 = st.columns([3, 1])
+            with search_col1:
+                search_page = st.text_input("🔍 搜索页面（输入页码，如：3051）", key="search_page_initial", placeholder="输入页码搜索...")
+            with search_col2:
+                search_method = st.selectbox("筛选方法", ["全部", "仅Basic", "仅SSG", "仅Triangulation", "SSG+Triangulation", "三种方法联合"], key="filter_method_initial")
+            
+            # 使用输入的值进行过滤
+            search_page_value = search_page
+            search_method_value = search_method
+            
+            # 过滤结果
+            filtered_chunks = initial_chunks
+            if search_page_value:
+                try:
+                    search_page_num = int(search_page_value)
+                    filtered_chunks = [c for c in filtered_chunks if c.get('page') == search_page_num]
+                    if filtered_chunks:
+                        st.success(f"✅ 找到 {len(filtered_chunks)} 个匹配的结果（页码: {search_page_num}）")
+                    else:
+                        st.warning(f"⚠️ 未找到页码为 {search_page_value} 的结果。共 {len(initial_chunks)} 个结果，请检查页码是否正确。")
+                except ValueError:
+                    st.error("请输入有效的页码数字")
+            
+            if search_method_value != "全部":
+                if search_method_value == "仅Basic":
+                    filtered_chunks = [c for c in filtered_chunks if 'basic' in c.get('retrieval_sources', []) and len(c.get('retrieval_sources', [])) == 1]
+                elif search_method_value == "仅SSG":
+                    filtered_chunks = [c for c in filtered_chunks if 'ssg' in c.get('retrieval_sources', []) and 'basic' not in c.get('retrieval_sources', [])]
+                elif search_method_value == "仅Triangulation":
+                    filtered_chunks = [c for c in filtered_chunks if 'triangulation' in c.get('retrieval_sources', []) and 'basic' not in c.get('retrieval_sources', [])]
+                elif search_method_value == "SSG+Triangulation":
+                    filtered_chunks = [c for c in filtered_chunks if 'ssg' in c.get('retrieval_sources', []) and 'triangulation' in c.get('retrieval_sources', []) and 'basic' not in c.get('retrieval_sources', [])]
+                elif search_method_value == "三种方法联合":
+                    filtered_chunks = [c for c in filtered_chunks if len(c.get('retrieval_sources', [])) == 3]
+            
+            if search_page_value or search_method_value != "全部":
+                st.info(f"显示 {len(filtered_chunks)} / {len(initial_chunks)} 个结果")
+                st.markdown("---")
+            
+            for chunk in filtered_chunks:
+                rank = chunk.get('rank', 0)
+                page = chunk.get('page', 'N/A')
+                source_sha1 = chunk.get('source_sha1', '')
+                text = chunk.get('text', '')
+                vector_score = chunk.get('vector_score', 0.0)  # 最终向量相似度得分（加权后）
+                max_original_score = chunk.get('max_original_score', vector_score)  # 原始向量相似度最高分
+                hit_count = chunk.get('hit_count', 1)
+                retrieval_sources = chunk.get('retrieval_sources', ['basic'])  # 检索方法来源列表
+                query_sources = chunk.get('query_sources', [])  # 查询来源列表
+                
+                # 获取文档显示名称
+                doc_info = doc_mapping.get(source_sha1, {})
+                doc_display_name = doc_info.get('display_name', source_sha1)
+                
+                # 显示样式
+                if hit_count > 1:
+                    icon = "🔗"
+                    badge = f'<span style="background-color: #ffc107; color: #333; padding: 2px 8px; border-radius: 3px; font-size: 0.85em;">🔗 命中{hit_count}次</span>'
+                    border_color = "#ffc107"
+                else:
+                    icon = "📄"
+                    badge = '<span style="background-color: #6c757d; color: white; padding: 2px 8px; border-radius: 3px; font-size: 0.85em;">单次命中</span>'
+                    border_color = "#6c757d"
+                
+                # 显示每个chunk
+                with st.expander(
+                    f"{icon} 排名 #{rank} - {doc_display_name} 第{page}页 - 最终得分: {vector_score:.4f}",
+                    expanded=(rank <= 5)  # 默认展开前5个
+                ):
+                    # 顶部信息栏
+                    st.markdown(f"""
+                    <div style="background-color: #f8f9fa; padding: 10px; border-radius: 5px; margin-bottom: 10px; border-left: 4px solid {border_color};">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <div style="color: #333;">
+                                <strong style="color: #333;">📁 文档:</strong> <span style="color: #333;">{doc_display_name}</span> | 
+                                <strong style="color: #333;">📄 页码:</strong> <span style="color: #333;">{page}</span> |
+                                <strong style="color: #333;">🏆 排名:</strong> <span style="color: #333;">#{rank}</span>
+                            </div>
+                            <div>
+                                {badge}
+                            </div>
+                        </div>
+                        <div style="margin-top: 8px; font-size: 0.9em; color: #333;">
+                            <strong style="color: #333;">🔗 SHA1:</strong> <code style="color: #333; background-color: #e9ecef; padding: 2px 6px; border-radius: 3px;">{source_sha1}</code>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # 显示方法多样性 - 创建tag样式的badge
+                    method_badges_html = []
+                    if 'basic' in retrieval_sources:
+                        method_badges_html.append('<span style="background-color: #007bff; color: white; padding: 2px 8px; border-radius: 3px; font-size: 0.85em; margin-right: 4px;">🎯 基础检索</span>')
+                    if 'ssg' in retrieval_sources:
+                        method_badges_html.append('<span style="background-color: #28a745; color: white; padding: 2px 8px; border-radius: 3px; font-size: 0.85em; margin-right: 4px;">🔗 SSG扩展</span>')
+                    if 'triangulation' in retrieval_sources:
+                        method_badges_html.append('<span style="background-color: #17a2b8; color: white; padding: 2px 8px; border-radius: 3px; font-size: 0.85em; margin-right: 4px;">🔺 Triangulation扩展</span>')
+                    
+                    method_badges_text = []
+                    if 'basic' in retrieval_sources:
+                        method_badges_text.append('🎯 基础检索')
+                    if 'ssg' in retrieval_sources:
+                        method_badges_text.append('🔗 SSG扩展')
+                    if 'triangulation' in retrieval_sources:
+                        method_badges_text.append('🔺 Triangulation扩展')
+                    
+                    # 得分详情 - 显示四个关键指标
+                    st.markdown("**📊 得分详情:**")
+                    score_cols = st.columns(4)
+                    with score_cols[0]:
+                        st.metric(
+                            "最大相似度", 
+                            f"{max_original_score:.6f}", 
+                            help="多个查询命中时的最高相似度得分（未加权前）"
+                        )
+                    with score_cols[1]:
+                        st.metric(
+                            "命中次数", 
+                            hit_count, 
+                            help="被多个查询命中的次数（HYDE/Multi-Query聚合时）"
+                        )
+                    with score_cols[2]:
+                        st.metric(
+                            "方法多样性", 
+                            f"{len(retrieval_sources)}种", 
+                            help="被多少种检索方法命中"
+                        )
+                    with score_cols[3]:
+                        st.metric(
+                            "最终得分", 
+                            f"{vector_score:.6f}", 
+                            help="加权后的最终得分（原始最高分 × 查询奖励 × 方法多样性奖励），用于排序"
+                        )
+                    
+                    # 显示方法来源 - 使用tag样式
+                    if len(retrieval_sources) > 1:
+                        st.markdown(f"""
+                        <div style="margin-top: 10px; margin-bottom: 5px;">
+                            <strong style="color: #333;">🔍 检索方法来源:</strong> {' '.join(method_badges_html)}
+                        </div>
+                        """, unsafe_allow_html=True)
+                        st.caption(f"💡 方法多样性奖励：被{len(retrieval_sources)}种方法命中，获得额外奖励")
+                    elif len(retrieval_sources) == 1:
+                        # 即使只有一种方法，也显示tag
+                        st.markdown(f"""
+                        <div style="margin-top: 10px; margin-bottom: 5px;">
+                            <strong style="color: #333;">🔍 检索方法来源:</strong> {' '.join(method_badges_html)}
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    # 如果命中多次，显示加权说明
+                    if hit_count > 1:
+                        query_bonus = 1.0 + 0.2 * (hit_count - 1)
+                        method_diversity_bonus = 1.0 + 0.1 * (len(retrieval_sources) - 1) if len(retrieval_sources) >= 2 else 1.0
+                        total_bonus = query_bonus * method_diversity_bonus
+                        st.caption(f"💡 加权说明：原始最高分 {max_original_score:.6f} × 查询奖励 {query_bonus:.2f} × 方法多样性奖励 {method_diversity_bonus:.2f} = 最终得分 {vector_score:.6f}")
+                    elif len(retrieval_sources) > 1:
+                        method_diversity_bonus = 1.0 + 0.1 * (len(retrieval_sources) - 1)
+                        st.caption(f"💡 加权说明：原始最高分 {max_original_score:.6f} × 方法多样性奖励 {method_diversity_bonus:.2f} = 最终得分 {vector_score:.6f}")
+                    
+                    # 文本内容
+                    st.markdown("**📝 文本内容:**")
+                    st.text_area(
+                        "文本",
+                        text,
+                        height=150,
+                        key=f"initial_chunk_{rank}_{page}_{source_sha1}",
+                        label_visibility="collapsed"
+                    )
+        else:
+            st.info("无初始召回结果信息（可能未启用LLM重排序）")
+    
+    with tab6:
+        # 查询扩展详解 Tab
+        st.markdown("### 🔄 查询扩展详解")
+        st.caption("展示所有用于检索的查询，包括原始查询、HYDE扩展和Multi-Query扩展")
+        
+        if "expansion_texts" in answer_dict:
+            expansion_texts = answer_dict.get("expansion_texts", {})
+            
+            # 获取原始问题（从函数参数或历史记录中获取）
+            original_question = question if question else (answer_dict.get('question', '') or st.session_state.get('current_question', 'N/A'))
+            
+            # 统计查询数量
+            hyde_queries = 1 if expansion_texts.get('hyde_text') else 0
+            multi_query_texts = expansion_texts.get('multi_query_texts', [])
+            multi_query_count = len(multi_query_texts)
+            
+            # 计算实际执行的查询数量（包括原始查询、HYDE、Multi-Query）
+            # 注意：可能查询会被去重，所以实际执行的查询数可能小于这个值
+            total_queries_calculated = 1 + hyde_queries + multi_query_count  # 原始查询 + HYDE + Multi-Query
+            
+            # 显示统计信息
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("总查询数", total_queries_calculated, help="原始查询 + HYDE + Multi-Query扩展查询的总数")
+            with col2:
+                st.metric("原始查询", "1", help="用户输入的最原始问题")
+            with col3:
+                st.metric("HYDE查询", hyde_queries, help="HYDE方法生成的假设答案查询")
+            with col4:
+                st.metric("Multi-Query", multi_query_count, delta=f"共{multi_query_count}个", help=f"Multi-Query方法扩展的查询数量（实际生成了{multi_query_count}个查询）")
+            
+            # 如果有多次命中，显示警告信息
+            if multi_query_count > 1:
+                st.info(f"💡 Multi-Query扩展生成了 {multi_query_count} 个查询。如果某个chunk的命中次数达到 {total_queries_calculated}，说明它被所有查询（原始+HYPE+所有Multi-Query）都命中了。")
+            
+            st.markdown("---")
+            
+            # 1. 原始查询
+            st.markdown("#### 📝 原始查询")
+            st.text_area(
+                "原始查询",
+                original_question,
+                height=100,
+                key="original_query_display",
+                label_visibility="collapsed",
+                disabled=True
+            )
+            
+            st.markdown("---")
+            
+            # 2. HYDE扩展文本
+            if expansion_texts.get('hyde_text'):
+                st.markdown("#### 🔮 HYDE 扩展（假设答案）")
+                st.caption("HYDE方法生成的假设答案文本，作为额外的查询用于增强检索")
+                st.text_area(
+                    "HYDE Text",
+                    expansion_texts['hyde_text'],
+                    height=200,
+                    key="hyde_text_display_new",
+                    label_visibility="collapsed"
+                )
+            else:
+                st.markdown("#### 🔮 HYDE 扩展")
+                st.info("❌ 未启用HYDE扩展")
+            
+            st.markdown("---")
+            
+            # 3. Multi-Query扩展文本
+            multi_query_texts = expansion_texts.get('multi_query_texts', [])
+            mq_methods_used = expansion_texts.get('multi_query_methods', {})
+            
+            st.markdown("#### 🔄 Multi-Query 扩展（扩展查询）")
+            
+            # 检查是否启用了 Multi-Query
+            if not any(mq_methods_used.values()):
+                st.info("❌ 未启用 Multi-Query 扩展")
+            elif multi_query_texts:
+                st.caption(f"Multi-Query方法生成的扩展查询，共 {len(multi_query_texts)} 个")
+                
+                # 按方法分组显示
+                method_groups = {}
+                for mq_item in multi_query_texts:
+                    method_id = mq_item.get('method_id', 0)
+                    if method_id not in method_groups:
+                        method_groups[method_id] = []
+                    method_groups[method_id].append(mq_item)
+                
+                method_names = {
+                    1: "名词解释",
+                    2: "指标拆分",
+                    3: "情景变体"
+                }
+                
+                for method_id in sorted(method_groups.keys()):
+                    method_name = method_names.get(method_id, f"方法{method_id}")
+                    method_items = method_groups[method_id]
+                    
+                    st.markdown(f"##### 📌 {method_name} (共 {len(method_items)} 个查询)")
+                    
+                    for idx, mq_item in enumerate(method_items, 1):
+                        query_text = mq_item.get('query', '')
+                        concepts = mq_item.get('concepts', [])
+                        
+                        with st.expander(f"查询 {idx}: {query_text[:80]}{'...' if len(query_text) > 80 else ''}", expanded=(idx == 1)):
+                            st.text_area(
+                                f"Multi-Query {method_id}-{idx}",
+                                query_text,
+                                height=120,
+                                key=f"multi_query_detail_{method_id}_{idx}",
+                                label_visibility="collapsed"
+                            )
+                            if concepts:
+                                st.caption(f"📚 相关财务术语: {', '.join(concepts[:5])}{'...' if len(concepts) > 5 else ''}")
+            else:
+                # Multi-Query 已启用但没有生成扩展查询（LLM 判断问题已足够清晰）
+                st.info("✅ Multi-Query 已启用，但 LLM 判断当前问题已足够清晰，无需扩展查询")
+            
+            # 显示启用的 Multi-Query 方法
+            if any(mq_methods_used.values()):
+                st.markdown("---")
+                st.markdown("##### ⚙️ 本次启用的扩展方式")
+                label_map = {
+                    'synonym': "✅ 名词解释",
+                    'subquestion': "✅ 指标拆分",
+                    'variant': "✅ 情景变体"
+                }
+                enabled_labels = [label_map.get(k, f"✅ {k}") for k, v in mq_methods_used.items() if v]
+                disabled_labels = [f"❌ {label_map.get(k, k).replace('✅ ', '')}" for k, v in mq_methods_used.items() if not v]
+                
+                cols = st.columns(3)
+                for idx, label in enumerate(enabled_labels + disabled_labels):
+                    with cols[idx % 3]:
+                        st.markdown(f"**{label}**")
+            
+            # 显示名词解释（Glossary）
+            glossary_context = expansion_texts.get('glossary_context')
+            if glossary_context:
+                st.markdown("---")
+                st.markdown("#### 📖 Multi-Query 使用的财务名词解释（Glossary）")
+                st.caption("从财务术语词汇表中匹配到的相关术语及其定义")
+                st.text_area(
+                    "Glossary Context",
+                    glossary_context,
+                    height=250,
+                    key="multi_query_glossary_display_new",
+                    label_visibility="collapsed"
+                )
+        else:
+            st.info("⚠️ 查询扩展信息不可用（可能未启用查询扩展功能）")
+    
+    with tab7:
         # 显示生成阶段的提示词信息
         if "prompt_info" in answer_dict:
             prompt_info = answer_dict["prompt_info"]
@@ -876,91 +1350,131 @@ def format_answer_display(answer_dict: dict, question: str = ""):
                 key="question_display",
                 label_visibility="collapsed"
             )
-            
-            # 展示扩展文本（HYDE和Multi-Query）
-            if "expansion_texts" in answer_dict:
-                expansion_texts = answer_dict.get("expansion_texts", {})
-                
-                st.markdown("---")
-                st.markdown("### 🔄 查询扩展生成的文本")
-                
-                # HYDE扩展文本
-                if expansion_texts.get('hyde_text'):
-                    st.markdown("#### 🔮 HYDE 扩展（假设答案）")
-                    st.caption("HYDE方法生成的假设答案文本，用于增强检索")
-                    st.text_area(
-                        "HYDE Text",
-                        expansion_texts['hyde_text'],
-                        height=200,
-                        key="hyde_text_display",
-                        label_visibility="collapsed"
-                    )
-                else:
-                    st.markdown("#### 🔮 HYDE 扩展")
-                    st.info("未启用HYDE扩展")
-                
-                st.markdown("---")
-                
-                # Multi-Query扩展文本
-                multi_query_texts = expansion_texts.get('multi_query_texts', [])
-                mq_methods_used = expansion_texts.get('multi_query_methods', {})
-                
-                st.markdown("#### 🔄 Multi-Query 扩展（扩展查询）")
-                
-                # 检查是否启用了 Multi-Query
-                if not any(mq_methods_used.values()):
-                    st.info("⚪ 未启用 Multi-Query 扩展")
-                elif multi_query_texts:
-                    st.caption(f"Multi-Query方法生成的扩展查询，共 {len(multi_query_texts)} 个")
-                    
-                    for idx, mq_item in enumerate(multi_query_texts, 1):
-                        method_id = mq_item.get('method_id', idx)
-                        query_text = mq_item.get('query', '')
-                        
-                        method_names = {
-                            1: "名词解释",
-                            2: "指标拆分",
-                            3: "情景变体"
-                        }
-                        method_name = method_names.get(method_id, f"方法{method_id}")
-                        
-                        with st.expander(f"📝 {method_name} (方法 {method_id})", expanded=(idx == 1)):
-                            st.text_area(
-                                f"扩展查询 {idx}",
-                                query_text,
-                                height=100,
-                                key=f"multi_query_{method_id}_{idx}",
-                                label_visibility="collapsed"
-                            )
-                else:
-                    # Multi-Query 已启用但没有生成扩展查询（LLM 判断问题已足够清晰）
-                    st.info("✅ Multi-Query 已启用，但 LLM 判断当前问题已足够清晰，无需扩展查询")
-
-                # 显示启用的 Multi-Query 方法
-                if any(mq_methods_used.values()):
-                    label_map = {
-                        'synonym': "名词解释",
-                        'subquestion': "指标拆分",
-                        'variant': "情景变体"
-                    }
-                    enabled_labels = [label_map[k] for k, v in mq_methods_used.items() if v]
-                    if enabled_labels:
-                        st.caption("本次启用的扩展方式：" + "、".join(enabled_labels))
-                
-                # 显示名词解释（Glossary）
-                glossary_context = expansion_texts.get('glossary_context')
-                if glossary_context:
-                    st.markdown("---")
-                    st.markdown("##### 📖 Multi-Query 使用的财务名词解释")
-                    st.text_area(
-                        "Glossary Context",
-                        glossary_context,
-                        height=220,
-                        key="multi_query_glossary_display",
-                        label_visibility="collapsed"
-                    )
         else:
             st.info("⚠️ 提示词信息不可用（可能是旧版本的答案）")
+    
+    with tab8:
+        # 显示算法贡献分析（仅hybrid_expansion）
+        if "algorithm_contribution" in answer_dict:
+            algo_contrib = answer_dict["algorithm_contribution"]
+            
+            st.markdown("### 🔬 算法贡献分析（Hybrid Expansion模式）")
+            st.caption("本页面展示SSG和Triangulation算法相比Basic Retrieval额外发现的chunk")
+            
+            # 统计信息
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("基础检索数量", algo_contrib.get("basic_retrieval_count", 0))
+            with col2:
+                st.metric("SSG新发现", algo_contrib.get("ssg_new_chunks_count", 0), 
+                         help="SSG扩展发现的、不在Basic Top-50中的chunk数量")
+            with col3:
+                st.metric("Triangulation新发现", algo_contrib.get("triangulation_new_chunks_count", 0),
+                         help="Triangulation扩展发现的、不在Basic Top-50中的chunk数量")
+            
+            # SSG新发现的chunk
+            ssg_chunks = algo_contrib.get("ssg_new_chunks", [])
+            if ssg_chunks:
+                st.markdown("---")
+                st.markdown("#### 🔗 SSG扩展新发现的Chunk")
+                st.caption(f"共 {len(ssg_chunks)} 个chunk（不在Basic Top-50中）")
+                
+                for idx, chunk_info in enumerate(ssg_chunks, 1):
+                    page = chunk_info.get("page", "N/A")
+                    text = chunk_info.get("text", "")
+                    similarity = chunk_info.get("vector_similarity", 0.0)
+                    anchor_page = chunk_info.get("anchor_page", "N/A")
+                    source_sha1 = chunk_info.get("source_sha1", "")
+                    
+                    # 获取文档显示名称
+                    doc_info = doc_mapping.get(source_sha1, {})
+                    doc_display_name = doc_info.get('display_name', source_sha1)
+                    
+                    with st.expander(f"🔗 SSG新发现 #{idx} - {doc_display_name} 第{page}页 (相似度: {similarity:.4f})", expanded=(idx <= 3)):
+                        st.markdown(f"""
+                        <div style="background-color: #e8f5e9; padding: 10px; border-radius: 5px; margin-bottom: 10px; border-left: 4px solid #4caf50;">
+                            <div style="color: #333;">
+                                <strong style="color: #333;">📁 文档:</strong> <span style="color: #333;">{doc_display_name}</span> | 
+                                <strong style="color: #333;">📄 页码:</strong> <span style="color: #333;">{page}</span> |
+                                <strong style="color: #333;">🎯 锚点:</strong> <span style="color: #333;">第{anchor_page}页</span>
+                            </div>
+                            <div style="margin-top: 8px; font-size: 0.9em; color: #333;">
+                                <strong style="color: #333;">🔗 SHA1:</strong> <code style="color: #333; background-color: #c8e6c9; padding: 2px 6px; border-radius: 3px;">{source_sha1}</code> |
+                                <strong style="color: #333;">📊 相似度:</strong> <span style="color: #333;">{similarity:.6f}</span>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        st.markdown("**📝 文本内容:**")
+                        st.text_area(
+                            "文本",
+                            text,
+                            height=150,
+                            key=f"ssg_new_chunk_{idx}_{page}_{source_sha1}",
+                            label_visibility="collapsed"
+                        )
+            else:
+                st.info("🔗 SSG扩展未发现新的chunk（所有SSG扩展的结果都在Basic Top-50中）")
+            
+            # Triangulation新发现的chunk
+            tri_chunks = algo_contrib.get("triangulation_new_chunks", [])
+            if tri_chunks:
+                st.markdown("---")
+                st.markdown("#### 🔺 Triangulation扩展新发现的Chunk")
+                st.caption(f"共 {len(tri_chunks)} 个chunk（不在Basic Top-50中）")
+                
+                for idx, chunk_info in enumerate(tri_chunks, 1):
+                    page = chunk_info.get("page", "N/A")
+                    text = chunk_info.get("text", "")
+                    similarity = chunk_info.get("vector_similarity", 0.0)
+                    anchor_page = chunk_info.get("anchor_page", "N/A")
+                    source_sha1 = chunk_info.get("source_sha1", "")
+                    
+                    # 获取文档显示名称
+                    doc_info = doc_mapping.get(source_sha1, {})
+                    doc_display_name = doc_info.get('display_name', source_sha1)
+                    
+                    with st.expander(f"🔺 Triangulation新发现 #{idx} - {doc_display_name} 第{page}页 (相似度: {similarity:.4f})", expanded=(idx <= 3)):
+                        st.markdown(f"""
+                        <div style="background-color: #e3f2fd; padding: 10px; border-radius: 5px; margin-bottom: 10px; border-left: 4px solid #2196f3;">
+                            <div style="color: #333;">
+                                <strong style="color: #333;">📁 文档:</strong> <span style="color: #333;">{doc_display_name}</span> | 
+                                <strong style="color: #333;">📄 页码:</strong> <span style="color: #333;">{page}</span> |
+                                <strong style="color: #333;">🎯 锚点:</strong> <span style="color: #333;">第{anchor_page}页</span>
+                            </div>
+                            <div style="margin-top: 8px; font-size: 0.9em; color: #333;">
+                                <strong style="color: #333;">🔗 SHA1:</strong> <code style="color: #333; background-color: #bbdefb; padding: 2px 6px; border-radius: 3px;">{source_sha1}</code> |
+                                <strong style="color: #333;">📊 相似度:</strong> <span style="color: #333;">{similarity:.6f}</span>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        st.markdown("**📝 文本内容:**")
+                        st.text_area(
+                            "文本",
+                            text,
+                            height=150,
+                            key=f"tri_new_chunk_{idx}_{page}_{source_sha1}",
+                            label_visibility="collapsed"
+                        )
+            else:
+                st.info("🔺 Triangulation扩展未发现新的chunk（所有Triangulation扩展的结果都在Basic Top-50中）")
+            
+            # 总结
+            if not ssg_chunks and not tri_chunks:
+                st.warning("⚠️ **重要发现**：SSG和Triangulation扩展的结果都回到了Basic Top-50中，没有发现新的chunk。")
+                st.markdown("""
+                **可能的原因：**
+                1. Basic检索的Top-50已经覆盖了大部分相关chunk
+                2. SSG和Triangulation的扩展范围有限（max_hops=4）
+                3. 图结构中的邻居chunk与查询的相似度较高，已被Basic检索覆盖
+                
+                **建议：**
+                - 可以尝试增加`max_hops`参数，扩大扩展范围
+                - 或者调整`neighbor_k`参数，增加每跳的候选数量
+                """)
+        else:
+            st.info("ℹ️ 算法贡献分析仅在使用 **混合扩展 (Hybrid Expansion)** 检索方法时可用")
 
 def save_history():
     """保存问答历史"""
@@ -1032,7 +1546,10 @@ with st.sidebar:
                 'synonym': True,
                 'subquestion': False,
                 'variant': False
-            }
+            },
+            'retrieval_method': 'basic',
+            'max_hops': 4,
+            'neighbor_k': 30
         }
     
     flow_steps = [
@@ -1135,6 +1652,47 @@ with st.sidebar:
     )
     
     with st.expander("⚙️ 基础检索", expanded=(selected_step == "retrieval")):
+        # 检索算法选择
+        retrieval_method_options = {
+            "basic": "基础检索 (Basic Retrieval)",
+            "ssg": "SSG 图遍历 (SSG Traversal Algorithm)",
+            "triangulation": "三角测量 (Triangulation FullDim Algorithm)",
+            "hybrid_expansion": "混合扩展 (Hybrid Expansion) - 试验性"
+        }
+        current_method = config_defaults.get('retrieval_method', 'basic')
+        retrieval_method = st.selectbox(
+            "🔍 检索算法",
+            options=list(retrieval_method_options.keys()),
+            index=list(retrieval_method_options.keys()).index(current_method) if current_method in retrieval_method_options else 0,
+            format_func=lambda x: retrieval_method_options[x],
+            help="选择检索算法：基础检索使用直接相似度排序；SSG和Triangulation使用图遍历算法"
+        )
+        
+        # SSG和Triangulation的参数配置
+        if retrieval_method in ["ssg", "triangulation", "hybrid_expansion"]:
+            col1, col2 = st.columns(2)
+            with col1:
+                max_hops = st.number_input(
+                    "🔄 最大跳数 (Max Hops)",
+                    min_value=1,
+                    max_value=10,
+                    value=config_defaults.get('max_hops', 4),
+                    step=1,
+                    help="图遍历的最大跳数，控制探索深度"
+                )
+            with col2:
+                neighbor_k = st.number_input(
+                    "🔗 邻居数量 (Neighbor K)",
+                    min_value=5,
+                    max_value=50,
+                    value=config_defaults.get('neighbor_k', 30),
+                    step=5,
+                    help="每跳考虑的邻居chunk数量"
+                )
+        else:
+            max_hops = 4
+            neighbor_k = 30
+        
         top_n_retrieval = st.slider(
             "📊 最终检索数量",
             min_value=5,
@@ -1315,7 +1873,10 @@ with st.sidebar:
         'expand_top_k': expand_top_k,
         'expand_context_size': expand_context_size,
         'parallel_requests': parallel_requests,
-        'multi_query_methods': selected_multi_query_methods
+        'multi_query_methods': selected_multi_query_methods,
+        'retrieval_method': retrieval_method,
+        'max_hops': max_hops,
+        'neighbor_k': neighbor_k
     }
     
     # 如果配置改变且系统已初始化，需要重新初始化
@@ -1474,6 +2035,50 @@ with st.sidebar:
                 help="最终返回的检索结果数量",
                 key="eval_top_n"
             )
+            
+            # 检索算法选择
+            eval_retrieval_method_options = {
+                "basic": "基础检索 (Basic Retrieval)",
+                "ssg": "SSG 图遍历 (SSG Traversal Algorithm)",
+                "triangulation": "三角测量 (Triangulation FullDim Algorithm)",
+                "hybrid_expansion": "混合扩展 (Hybrid Expansion) - 试验性"
+            }
+            eval_current_method = config_defaults.get('retrieval_method', 'basic')
+            eval_retrieval_method = st.selectbox(
+                "🔍 检索算法",
+                options=list(eval_retrieval_method_options.keys()),
+                index=list(eval_retrieval_method_options.keys()).index(eval_current_method) if eval_current_method in eval_retrieval_method_options else 0,
+                format_func=lambda x: eval_retrieval_method_options[x],
+                help="选择检索算法：基础检索使用直接相似度排序；SSG和Triangulation使用图遍历算法",
+                key="eval_retrieval_method"
+            )
+            
+            # SSG、Triangulation和Hybrid Expansion的参数配置
+            if eval_retrieval_method in ["ssg", "triangulation", "hybrid_expansion"]:
+                eval_col1, eval_col2 = st.columns(2)
+                with eval_col1:
+                    eval_max_hops = st.number_input(
+                        "🔄 最大跳数 (Max Hops)",
+                        min_value=1,
+                        max_value=10,
+                        value=config_defaults.get('max_hops', 4),
+                        step=1,
+                        help="图遍历的最大跳数，控制探索深度",
+                        key="eval_max_hops"
+                    )
+                with eval_col2:
+                    eval_neighbor_k = st.number_input(
+                        "🔗 邻居数量 (Neighbor K)",
+                        min_value=5,
+                        max_value=50,
+                        value=config_defaults.get('neighbor_k', 30),
+                        step=5,
+                        help="每跳考虑的邻居chunk数量",
+                        key="eval_neighbor_k"
+                    )
+            else:
+                eval_max_hops = 4
+                eval_neighbor_k = 30
         
         # 应用评估配置按钮
         if st.button("✅ 应用此配置到评估", use_container_width=True):
@@ -1490,7 +2095,10 @@ with st.sidebar:
                 'expand_upstream': eval_expand_upstream,
                 'expand_top_k': eval_expand_top_k,
                 'expand_context_size': eval_expand_context_size,
-                'top_n_retrieval': eval_top_n
+                'top_n_retrieval': eval_top_n,
+                'retrieval_method': eval_retrieval_method,
+                'max_hops': eval_max_hops,
+                'neighbor_k': eval_neighbor_k
             }
             st.success("✅ 评估配置已应用！点击下方按钮开始评估")
     
@@ -1664,6 +2272,9 @@ with main_tab1:
                     'expand_upstream': eval_config.get('expand_upstream', False),
                     'expand_top_k': eval_config.get('expand_top_k', 5),
                     'expand_context_size': eval_config.get('expand_context_size', 1),
+                    'retrieval_method': eval_config.get('retrieval_method', 'basic'),
+                    'max_hops': eval_config.get('max_hops', 4),
+                    'neighbor_k': eval_config.get('neighbor_k', 30),
                     'parent_document_retrieval': True,
                     'parallel_requests': config.get('parallel_requests', 4),
                     'answering_model': config.get('answering_model', 'qwen-max'),
@@ -1679,6 +2290,9 @@ with main_tab1:
                 st.session_state.processor.expand_top_k = eval_config['expand_top_k']
                 st.session_state.processor.expand_context_size = eval_config['expand_context_size']
                 st.session_state.processor.top_n_retrieval = eval_config['top_n_retrieval']
+                st.session_state.processor.retrieval_method = eval_config.get('retrieval_method', 'basic')
+                st.session_state.processor.max_hops = eval_config.get('max_hops', 4)
+                st.session_state.processor.neighbor_k = eval_config.get('neighbor_k', 30)
             else:
                 st.info("📋 使用当前流程配置进行评估")
                 # 使用当前配置
@@ -1692,6 +2306,9 @@ with main_tab1:
                     'expand_upstream': config.get('expand_upstream', False),
                     'expand_top_k': config.get('expand_top_k', 5),
                     'expand_context_size': config.get('expand_context_size', 2),
+                    'retrieval_method': config.get('retrieval_method', 'basic'),
+                    'max_hops': config.get('max_hops', 4),
+                    'neighbor_k': config.get('neighbor_k', 30),
                     'parent_document_retrieval': True,  # 默认启用父文档检索
                     'parallel_requests': config.get('parallel_requests', 4),
                     'answering_model': config.get('answering_model', 'qwen-max'),
@@ -1722,6 +2339,16 @@ with main_tab1:
             
             with conf_col2:
                 st.markdown("#### 📊 检索参数")
+                retrieval_method_display = {
+                    'basic': '基础检索 (Basic Retrieval)',
+                    'ssg': 'SSG 图遍历 (SSG Traversal Algorithm)',
+                    'triangulation': '三角测量 (Triangulation FullDim Algorithm)'
+                }
+                retrieval_method = config_info.get('retrieval_method', 'basic')
+                st.markdown(f"- **检索算法**: {retrieval_method_display.get(retrieval_method, retrieval_method)}")
+                if retrieval_method in ['ssg', 'triangulation']:
+                    st.markdown(f"  - 最大跳数: {config_info.get('max_hops', 4)}")
+                    st.markdown(f"  - 邻居数量: {config_info.get('neighbor_k', 30)}")
                 st.markdown(f"- **最终检索数量**: {config_info['top_n_retrieval']}")
                 st.markdown(f"- **父文档检索**: {'✅ 启用' if config_info['parent_document_retrieval'] else '❌ 关闭'}")
                 
@@ -2010,6 +2637,13 @@ if st.button("🚀 获取答案", type="primary", use_container_width=True):
             # 获取选中的年份（如果有）
             selected_years = st.session_state.get("selected_years", None)
             
+            # 动态更新处理器的检索算法参数（从当前配置中读取）
+            if st.session_state.processor:
+                current_config = st.session_state.config
+                st.session_state.processor.retrieval_method = current_config.get('retrieval_method', 'basic')
+                st.session_state.processor.max_hops = current_config.get('max_hops', 4)
+                st.session_state.processor.neighbor_k = current_config.get('neighbor_k', 30)
+            
             # 调用问答系统，传入真实的进度回调
             answer_dict = st.session_state.processor.get_answer_for_company(
                 company_name=company_name,
@@ -2029,6 +2663,9 @@ if st.button("🚀 获取答案", type="primary", use_container_width=True):
             # 清除进度显示
             progress_bar.empty()
             status_text.empty()
+            
+            # 保存answer_dict到session_state，以便在搜索/筛选时使用
+            st.session_state.answer_dict = answer_dict
             
             # 显示答案（传入问题以便查找标准答案）
             format_answer_display(answer_dict, full_question)
